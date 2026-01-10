@@ -65,7 +65,6 @@ export default function Dashboard() {
     ws.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
-        console.log('📨 Received from backend:', data);
 
         if (data.type === 'transcript') {
           const message: TranscriptMessage = {

@@ -89,11 +89,11 @@ const dashboardClients = new Set<WSType>();
 
 // Handle dashboard WebSocket connections
 dashboardWss.on('connection', (ws: WSType) => {
-  console.log('📱 Dashboard client connected');
+  console.log(`📱 Dashboard client connected (total: ${dashboardClients.size + 1})`);
   dashboardClients.add(ws);
 
   ws.on('close', () => {
-    console.log('📱 Dashboard client disconnected');
+    console.log(`📱 Dashboard client disconnected (remaining: ${dashboardClients.size - 1})`);
     dashboardClients.delete(ws);
   });
 
@@ -106,11 +106,24 @@ dashboardWss.on('connection', (ws: WSType) => {
 // Helper: Broadcast transcript to all dashboard clients
 function broadcastToDashboard(data: any) {
   const message = JSON.stringify(data);
+  let successCount = 0;
+  let failCount = 0;
+  
   dashboardClients.forEach((client) => {
     if (client.readyState === 1) { // 1 = OPEN
-      client.send(message);
+      try {
+        client.send(message);
+        successCount++;
+      } catch (error) {
+        console.error('❌ Failed to send to dashboard client:', error);
+        failCount++;
+      }
+    } else {
+      failCount++;
     }
   });
+  
+  console.log(`📡 Broadcast result: ${successCount} sent, ${failCount} failed, ${dashboardClients.size} total clients`);
 }
 
 // Middleware
@@ -293,12 +306,16 @@ app.all('/twilio/voice', (req, res) => {
     ? `wss://${PUBLIC_HOST}/twilio/media`
     : `wss://YOUR_NGROK_URL_HERE/twilio/media`;
 
-  // Minimal TwiML - known working configuration
+  // Your dispatcher phone number (the number that will receive the call)
+  const DISPATCHER_PHONE = process.env.DISPATCHER_PHONE || '+1234567890'; // Change this!
+
+  // TwiML that streams audio AND connects the call to dispatcher
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Connect>
-    <Stream url="${websocketUrl}" />
-  </Connect>
+  <Start>
+    <Stream url="${websocketUrl}" track="both_tracks" />
+  </Start>
+  <Dial>${DISPATCHER_PHONE}</Dial>
 </Response>`;
 
   // Set Content-Type explicitly
@@ -306,6 +323,7 @@ app.all('/twilio/voice', (req, res) => {
   res.send(twiml);
   
   console.log('✅ TwiML response sent with WebSocket URL:', websocketUrl);
+  console.log('📱 Call will ring:', DISPATCHER_PHONE);
 });
 
 // WebSocket handler for Twilio Media Streams
@@ -320,12 +338,10 @@ wss.on('connection', (ws: WSType, req) => {
 
   ws.on('message', async (message: Buffer) => {
     messageCount++;
-    console.log(`📬 Message #${messageCount} received (${message.length} bytes)`);
     
     try {
       const msg: TwilioMessage = JSON.parse(message.toString());
       
-      console.log('📨 Received Twilio event:', msg.event, JSON.stringify(msg).substring(0, 100) + '...');
 
       switch (msg.event) {
         case 'start':
@@ -407,11 +423,12 @@ async function initDeepgramConnection(callSid: string) {
   const connection = deepgram.listen.live({
     encoding: 'mulaw',
     sample_rate: 8000,
-    channels: 1,
+    channels: 2,  // Changed to 2 for both_tracks (caller + dispatcher)
     punctuate: true,
     interim_results: true,
     smart_format: true,
     model: 'nova-2',
+    multichannel: true,  // Enable multichannel transcription
   });
 
   // Handle transcript events
@@ -420,26 +437,37 @@ async function initDeepgramConnection(callSid: string) {
   });
 
   connection.on(LiveTranscriptionEvents.Transcript, async (data: any) => {
-    const transcript = data.channel?.alternatives?.[0]?.transcript;
+    // Debug: Log the entire data structure to understand what we're getting
+    // console.log('🔍 Raw Deepgram data:', JSON.stringify(data).substring(0, 200) + '...');
     
-    if (!transcript) return;
-
+    // With multichannel, Deepgram sends separate events for each channel
+    // channel_index tells us which channel this is
+    const channelIndex = data.channel_index?.[0]; // First element is the channel number
+    const transcript = data.channel?.alternatives?.[0]?.transcript;
     const isFinal = data.is_final;
     const confidence = data.channel?.alternatives?.[0]?.confidence;
+    
+    // Skip if no transcript
+    if (!transcript) {
+      return;
+    }
+    
+    // Channel 0 = Caller (inbound)
+    // Channel 1 = Dispatcher (outbound)  
+    const sender = channelIndex === 0 ? 'caller' : 'dispatcher';
 
     if (isFinal) {
-      console.log(`\n📝 [FINAL] Call ${callSid}: "${transcript}"`);
+      console.log(`\n📝 [FINAL] ${sender.toUpperCase()}: "${transcript}"`);
+      console.log(`   Channel: ${channelIndex}, Confidence: ${confidence}`);
       
       // Store final transcript in Supabase
-      await storeTranscript(callSid, 'caller', transcript, true, confidence);
-      
-      // TODO: Send this to Gemini for processing
+      await storeTranscript(callSid, sender, transcript, true, confidence);
     } else {
       // Partial transcript - can be useful for real-time UI updates
-      console.log(`⏳ [PARTIAL] Call ${callSid}: "${transcript}"`);
+      console.log(`⏳ [PARTIAL] ${sender.toUpperCase()}: "${transcript}"`);
       
       // Optionally store partial transcripts (commented out to reduce DB writes)
-      // await storeTranscript(callSid, 'caller', transcript, false, confidence);
+      // await storeTranscript(callSid, sender, transcript, false, confidence);
     }
   });
 
