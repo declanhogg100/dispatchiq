@@ -50,6 +50,61 @@ export default function Dashboard() {
   const debounceTimerRef = useRef<NodeJS.Timeout | null>(null);
   const DEBOUNCE_MS = 350;
 
+  // Subscribe to real-time transcripts via direct WebSocket connection to backend
+  useEffect(() => {
+    const wsUrl = 'ws://localhost:3001/dashboard';
+    console.log('🔌 Connecting to backend WebSocket:', wsUrl);
+    
+    const ws = new WebSocket(wsUrl);
+
+    ws.onopen = () => {
+      console.log('✅ Connected to backend WebSocket');
+      setStatus('connected');
+    };
+
+    ws.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        console.log('📨 Received from backend:', data);
+
+        if (data.type === 'transcript') {
+          const message: TranscriptMessage = {
+            id: data.id,
+            sender: data.sender as 'caller' | 'dispatcher',
+            text: data.text,
+            timestamp: new Date(data.timestamp),
+            isPartial: data.is_partial
+          };
+
+          setMessages((prev) => {
+            // Avoid duplicates
+            if (prev.some(m => m.id === message.id)) return prev;
+            return [...prev, message];
+          });
+          
+          setStatus('listening');
+        }
+      } catch (error) {
+        console.error('❌ Error parsing WebSocket message:', error);
+      }
+    };
+
+    ws.onerror = (error) => {
+      console.error('❌ WebSocket error:', error);
+      setStatus('disconnected');
+    };
+
+    ws.onclose = () => {
+      console.log('🔌 Disconnected from backend WebSocket');
+      setStatus('disconnected');
+    };
+
+    return () => {
+      console.log('🔌 Cleaning up WebSocket connection...');
+      ws.close();
+    };
+  }, []);
+
   const callAnalysisApi = useCallback(async () => {
     const latestMessage = messages[messages.length - 1];
     if (!latestMessage || latestMessage.isPartial) return;

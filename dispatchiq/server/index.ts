@@ -21,12 +21,15 @@ import express from 'express';
 import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
 import { createClient, LiveTranscriptionEvents } from '@deepgram/sdk';
+import { createClient as createSupabaseClient } from '@supabase/supabase-js';
 import type { WebSocket as WSType } from 'ws';
 
 // Environment variables
 const PORT = process.env.PORT || 3001;
 const PUBLIC_HOST = process.env.PUBLIC_HOST;
 const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
+const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 if (!DEEPGRAM_API_KEY) {
   console.error('❌ DEEPGRAM_API_KEY is required');
@@ -37,12 +40,78 @@ if (!PUBLIC_HOST) {
   console.warn('⚠️  PUBLIC_HOST not set. Make sure to configure Twilio with your actual WebSocket URL.');
 }
 
+// Initialize Supabase (optional - will work without it but won't store data)
+let supabase: ReturnType<typeof createSupabaseClient> | null = null;
+
+if (SUPABASE_URL && SUPABASE_SERVICE_KEY) {
+  supabase = createSupabaseClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
+  console.log('✅ Supabase client initialized');
+} else {
+  console.warn('⚠️  Supabase not configured. Transcripts will only appear in console.');
+}
+
 // Create Express app and HTTP server
 const app = express();
 const httpServer = createServer(app);
 
-// Create WebSocket server
-const wss = new WebSocketServer({ server: httpServer, path: '/twilio/media' });
+// Create WebSocket server for Twilio Media Streams with strict options
+const wss = new WebSocketServer({ 
+  noServer: true  // We'll handle the upgrade manually
+});
+
+// Create WebSocket server for Dashboard clients
+const dashboardWss = new WebSocketServer({ 
+  noServer: true
+});
+
+// Manual WebSocket upgrade handler
+httpServer.on('upgrade', (request, socket, head) => {
+  const pathname = new URL(request.url!, `http://${request.headers.host}`).pathname;
+  
+  console.log(`🔄 WebSocket upgrade request for: ${pathname}`);
+
+  if (pathname === '/twilio/media') {
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      wss.emit('connection', ws, request);
+    });
+  } else if (pathname === '/dashboard') {
+    dashboardWss.handleUpgrade(request, socket, head, (ws) => {
+      dashboardWss.emit('connection', ws, request);
+    });
+  } else {
+    console.log(`❌ Unknown WebSocket path: ${pathname}`);
+    socket.destroy();
+  }
+});
+
+// Store connected dashboard clients
+const dashboardClients = new Set<WSType>();
+
+// Handle dashboard WebSocket connections
+dashboardWss.on('connection', (ws: WSType) => {
+  console.log('📱 Dashboard client connected');
+  dashboardClients.add(ws);
+
+  ws.on('close', () => {
+    console.log('📱 Dashboard client disconnected');
+    dashboardClients.delete(ws);
+  });
+
+  ws.on('error', (error) => {
+    console.error('❌ Dashboard WebSocket error:', error);
+    dashboardClients.delete(ws);
+  });
+});
+
+// Helper: Broadcast transcript to all dashboard clients
+function broadcastToDashboard(data: any) {
+  const message = JSON.stringify(data);
+  dashboardClients.forEach((client) => {
+    if (client.readyState === 1) { // 1 = OPEN
+      client.send(message);
+    }
+  });
+}
 
 // Middleware
 app.use(express.json());
@@ -93,6 +162,123 @@ type TwilioMessage = TwilioStartMessage | TwilioMediaMessage | TwilioStopMessage
 // Store active Deepgram connections per call
 const activeConnections = new Map<string, any>();
 
+// Store call IDs mapping (callSid -> database call_id)
+const callIdMap = new Map<string, string>();
+
+// Helper: Create call record in Supabase
+async function createCallRecord(callSid: string, streamSid: string) {
+  console.log(`💾 Attempting to create call record for ${callSid}...`);
+  
+  if (!supabase) {
+    console.warn('⚠️  Supabase not available - skipping database insert');
+    return null;
+  }
+
+  try {
+    const { data, error } = await supabase
+      .from('calls')
+      .insert({
+        call_sid: callSid,
+        stream_sid: streamSid,
+        status: 'active'
+      } as any)
+      .select()
+      .single();
+
+    if (error) {
+      console.error('❌ Supabase error details:', JSON.stringify(error, null, 2));
+      throw error;
+    }
+    
+    callIdMap.set(callSid, (data as any).id);
+    console.log(`✅ Call record created successfully: ${(data as any).id}`);
+    return (data as any).id;
+  } catch (error) {
+    console.error('❌ Error creating call record:', error);
+    return null;
+  }
+}
+
+// Helper: Store transcript in Supabase
+async function storeTranscript(
+  callSid: string,
+  sender: 'caller' | 'dispatcher',
+  text: string,
+  isFinal: boolean,
+  confidence?: number
+) {
+  // Always broadcast to dashboard clients immediately
+  const transcriptData = {
+    type: 'transcript',
+    id: Date.now().toString() + Math.random(),
+    call_sid: callSid,
+    sender,
+    text,
+    is_final: isFinal,
+    is_partial: !isFinal,
+    confidence,
+    timestamp: new Date().toISOString()
+  };
+  
+  console.log(`📡 Broadcasting transcript to ${dashboardClients.size} dashboard client(s)`);
+  broadcastToDashboard(transcriptData);
+
+  // Also store in Supabase if configured
+  if (!supabase) {
+    console.warn('⚠️  Supabase not available - transcript not stored in DB');
+    return;
+  }
+
+  try {
+    const callId = callIdMap.get(callSid);
+    
+    console.log(`💾 Storing transcript for ${callSid} (call_id: ${callId}): "${text.substring(0, 30)}..."`);
+    
+    const { error } = await supabase
+      .from('transcripts')
+      .insert({
+        call_id: callId,
+        call_sid: callSid,
+        sender,
+        text,
+        is_final: isFinal,
+        is_partial: !isFinal,
+        confidence
+      } as any);
+
+    if (error) {
+      console.error('❌ Supabase error storing transcript:', JSON.stringify(error, null, 2));
+      throw error;
+    }
+    
+    console.log(`✅ Transcript stored successfully in DB`);
+  } catch (error) {
+    console.error('❌ Error storing transcript:', error);
+  }
+}
+
+// Helper: End call record
+async function endCallRecord(callSid: string) {
+  if (!supabase) return;
+
+  try {
+    const { error } = await supabase
+      .from('calls')
+      .update({
+        status: 'ended',
+        ended_at: new Date().toISOString()
+      } as any)
+      .eq('call_sid', callSid);
+
+    if (error) throw error;
+    
+    callIdMap.delete(callSid);
+    console.log(`💾 Call ended: ${callSid}`);
+  } catch (error) {
+    console.error('❌ Error ending call record:', error);
+  }
+}
+
 // Health check endpoint
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
@@ -107,13 +293,12 @@ app.all('/twilio/voice', (req, res) => {
     ? `wss://${PUBLIC_HOST}/twilio/media`
     : `wss://YOUR_NGROK_URL_HERE/twilio/media`;
 
+  // Minimal TwiML - known working configuration
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Start>
+  <Connect>
     <Stream url="${websocketUrl}" />
-  </Start>
-  <Say voice="alice">911, what is your emergency?</Say>
-  <Pause length="60"/>
+  </Connect>
 </Response>`;
 
   // Set Content-Type explicitly
@@ -127,16 +312,20 @@ app.all('/twilio/voice', (req, res) => {
 wss.on('connection', (ws: WSType, req) => {
   console.log('🔌 Twilio WebSocket connected from:', req.socket.remoteAddress);
   console.log('   Path:', req.url);
-  console.log('   Headers:', req.headers);
+  console.log('   Headers:', JSON.stringify(req.headers, null, 2));
   
   let callSid: string | null = null;
   let deepgramConnection: any = null;
+  let messageCount = 0;
 
   ws.on('message', async (message: Buffer) => {
+    messageCount++;
+    console.log(`📬 Message #${messageCount} received (${message.length} bytes)`);
+    
     try {
       const msg: TwilioMessage = JSON.parse(message.toString());
       
-      console.log('📨 Received Twilio event:', msg.event);
+      console.log('📨 Received Twilio event:', msg.event, JSON.stringify(msg).substring(0, 100) + '...');
 
       switch (msg.event) {
         case 'start':
@@ -144,6 +333,9 @@ wss.on('connection', (ws: WSType, req) => {
           console.log(`🚨 Call started: ${callSid}`);
           console.log(`   Stream SID: ${msg.start.streamSid}`);
           console.log(`   Media format: ${msg.start.mediaFormat.encoding} @ ${msg.start.mediaFormat.sampleRate}Hz`);
+
+          // Create call record in Supabase
+          await createCallRecord(callSid, msg.start.streamSid);
 
           // Initialize Deepgram connection
           deepgramConnection = await initDeepgramConnection(callSid);
@@ -160,6 +352,9 @@ wss.on('connection', (ws: WSType, req) => {
 
         case 'stop':
           console.log(`🛑 Call ended: ${msg.stop.callSid}`);
+          
+          // End call record in Supabase
+          await endCallRecord(msg.stop.callSid);
           
           // Clean up Deepgram connection
           if (deepgramConnection) {
@@ -192,6 +387,14 @@ wss.on('connection', (ws: WSType, req) => {
 
   ws.on('error', (error) => {
     console.error('❌ Twilio WebSocket error:', error);
+    
+    // Clean up on error
+    if (deepgramConnection) {
+      deepgramConnection.finish();
+      if (callSid) {
+        activeConnections.delete(callSid);
+      }
+    }
   });
 });
 
@@ -216,21 +419,27 @@ async function initDeepgramConnection(callSid: string) {
     console.log(`✅ Deepgram connection opened for call: ${callSid}`);
   });
 
-  connection.on(LiveTranscriptionEvents.Transcript, (data: any) => {
+  connection.on(LiveTranscriptionEvents.Transcript, async (data: any) => {
     const transcript = data.channel?.alternatives?.[0]?.transcript;
     
     if (!transcript) return;
 
     const isFinal = data.is_final;
-    const speaker = data.channel?.alternatives?.[0]?.words?.[0]?.speaker;
+    const confidence = data.channel?.alternatives?.[0]?.confidence;
 
     if (isFinal) {
       console.log(`\n📝 [FINAL] Call ${callSid}: "${transcript}"`);
+      
+      // Store final transcript in Supabase
+      await storeTranscript(callSid, 'caller', transcript, true, confidence);
+      
       // TODO: Send this to Gemini for processing
-      // TODO: Store in Supabase
     } else {
       // Partial transcript - can be useful for real-time UI updates
       console.log(`⏳ [PARTIAL] Call ${callSid}: "${transcript}"`);
+      
+      // Optionally store partial transcripts (commented out to reduce DB writes)
+      // await storeTranscript(callSid, 'caller', transcript, false, confidence);
     }
   });
 
