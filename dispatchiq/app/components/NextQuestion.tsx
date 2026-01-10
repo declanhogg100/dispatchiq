@@ -7,9 +7,9 @@ interface NextQuestionProps {
 
 export function NextQuestion({ question, loading }: NextQuestionProps) {
   return (
-    <div className="relative overflow-hidden rounded-xl bg-gradient-to-br from-indigo-600 to-violet-600 p-6 text-white shadow-lg">
-      <div className="flex items-center gap-2 text-indigo-100 mb-2">
-        <MessageCircleQuestion className="h-5 w-5" />
+    <div className="relative overflow-hidden rounded-xl border border-blue-300 bg-blue-200 p-6 text-blue-900 shadow-sm">
+      <div className="flex items-center gap-2 text-blue-900 mb-2">
+        <MessageCircleQuestion className="h-5 w-5 text-blue-800" />
         <span className="text-sm font-semibold uppercase tracking-wider">Next Best Question</span>
       </div>
       
@@ -28,10 +28,9 @@ export function NextQuestion({ question, loading }: NextQuestionProps) {
       </div>
 
       {/* Background decoration */}
-      <div className="absolute -right-6 -bottom-6 opacity-10">
+      <div className="absolute -right-6 -bottom-6 opacity-10 text-blue-300">
         <MessageCircleQuestion className="h-32 w-32" />
       </div>
     </div>
   );
 }
-

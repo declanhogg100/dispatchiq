@@ -10,6 +10,7 @@ import {
   IncidentDetails,
   TranscriptMessage,
   Urgency,
+  ReportResponsePayload,
 } from '../types';
 
 // Mock scenario: Reporting a fire
@@ -49,6 +50,8 @@ export default function Dashboard() {
   const lastAnalyzedIdRef = useRef<string | null>(null);
   const debounceTimerRef = useRef<NodeJS.Timeout | null>(null);
   const DEBOUNCE_MS = 350;
+  const [report, setReport] = useState<string | null>(null);
+  const [isGeneratingReport, setIsGeneratingReport] = useState(false);
 
   const callAnalysisApi = useCallback(async () => {
     const latestMessage = messages[messages.length - 1];
@@ -109,6 +112,7 @@ export default function Dashboard() {
     });
     setUrgency('Low');
     setNextQuestion(null);
+    setReport(null);
     lastAnalyzedIdRef.current = null;
 
     for (const step of MOCK_SCENARIO) {
@@ -140,6 +144,32 @@ export default function Dashboard() {
     
     setIsSimulationRunning(false);
     setStatus('connected');
+
+    // Generate report after simulation completes
+    setIsGeneratingReport(true);
+    try {
+      const response = await fetch('/api/report', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          messages,
+          incident: incidentDetails,
+          urgency,
+          callId: `sim-${Date.now()}`,
+        }),
+      });
+      if (response.ok) {
+        const data = (await response.json()) as ReportResponsePayload;
+        setReport(data.report);
+      } else {
+        setReport('Report generation failed.');
+      }
+    } catch (err) {
+      console.error(err);
+      setReport('Report generation failed.');
+    } finally {
+      setIsGeneratingReport(false);
+    }
   };
 
   useEffect(() => {
@@ -193,6 +223,16 @@ export default function Dashboard() {
                     >
                         {isSimulationRunning ? 'Simulation Running...' : 'Start Simulation'}
                     </button>
+                </div>
+                <div className="mt-4">
+                  <p className="text-xs font-semibold text-muted-foreground mb-1">
+                    Latest Report (debug)
+                  </p>
+                  <div className="rounded-lg border bg-white p-3 text-xs text-slate-700 max-h-48 overflow-auto">
+                    {isGeneratingReport && <span>Generating report...</span>}
+                    {!isGeneratingReport && report && <pre className="whitespace-pre-wrap">{report}</pre>}
+                    {!isGeneratingReport && !report && <span>No report yet.</span>}
+                  </div>
                 </div>
             </div>
         </section>

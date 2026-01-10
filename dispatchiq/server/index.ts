@@ -247,7 +247,7 @@ async function initDeepgramConnection(callSid: string) {
 
 // Start server
 httpServer.listen(PORT, () => {
-  console.log('\n🚨 SignalOne Dispatch Server');
+  console.log('\n🚨 DispatchIQ Server');
   console.log('================================');
   console.log(`✅ HTTP Server: http://localhost:${PORT}`);
   console.log(`✅ WebSocket: ws://localhost:${PORT}/twilio/media`);
@@ -272,4 +272,3 @@ process.on('SIGTERM', () => {
     process.exit(0);
   });
 });
-

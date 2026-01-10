@@ -31,3 +31,23 @@ export interface AnalysisResponsePayload {
   nextQuestion: string | null;
   rawModelText?: string;
 }
+
+// Report generation types
+export interface ReportRequestPayload {
+  messages: TranscriptMessage[];
+  incident: IncidentDetails;
+  urgency: Urgency;
+  callId?: string;
+  dispatcherId?: string;
+  callType?: string;
+  startedAt?: string;
+  endedAt?: string;
+  recordingUrl?: string;
+}
+
+export interface ReportResponsePayload {
+  report: string; // JSON string pretty-printed
+  rawModelText?: string;
+  storagePath?: string;
+  publicUrl?: string | null;
+}

@@ -9,7 +9,7 @@ export function Header({ status }: HeaderProps) {
     <header className="flex h-16 w-full items-center justify-between border-b border-border bg-card px-6">
       <div className="flex items-center gap-2">
         <Radio className="h-6 w-6 text-red-500 animate-pulse" />
-        <h1 className="text-xl font-bold tracking-tight text-foreground">SignalOne</h1>
+        <h1 className="text-xl font-bold tracking-tight text-foreground">DispatchIQ</h1>
       </div>
       
       <div className="flex items-center gap-2 rounded-full bg-secondary px-3 py-1 text-sm font-medium">
@@ -21,4 +21,3 @@ export function Header({ status }: HeaderProps) {
     </header>
   );
 }
-
