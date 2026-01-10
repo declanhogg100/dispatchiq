@@ -1,0 +1,197 @@
+---
+alwaysApply: true
+---
+
+
+# 🚨 SignalOne — Real-Time Emergency Dispatch AI Copilot
+
+## One-Sentence Pitch
+
+**SignalOne is an AI copilot that listens to emergency calls, tracks critical incident details, and tells dispatchers the right question to ask next — in real time.**
+
+---
+
+## Demo Goal
+
+During the demo, a **real person places a live phone call** to a phone number.
+
+As the call unfolds:
+
+* The caller speaks naturally
+* Call audio is transcribed **live**
+* An AI system continuously processes the conversation
+* A dispatcher dashboard updates in real time with:
+
+  * Auto-filled incident details
+  * Highlighted missing critical information
+  * A **single prioritized “Next Best Question”** to ask
+
+The demo prioritizes **reliability, clarity, and trust** over production completeness.
+
+---
+
+## Core User Flow
+
+1. Caller dials a phone number (via telephony provider)
+2. Call audio is streamed to **Deepgram** for real-time transcription
+3. Deepgram returns partial and final transcript updates
+4. Each transcript update is sent to the backend (**Node.js**)
+5. The backend sends transcript context to **Gemini (LLM)** for processing
+6. Gemini:
+
+   * Extracts structured incident data
+   * Detects missing critical information
+   * Generates one prioritized next best question
+7. Processed state is stored and synced via **Supabase**
+8. The frontend dispatcher dashboard updates instantly
+
+---
+
+## Core Features (MVP)
+
+### 1. Live Call Transcription
+
+* Real-time speech-to-text using **Deepgram**
+* Streaming transcription with low latency
+* Supports partial and final transcript updates
+
+---
+
+### 2. Structured Information Extraction
+
+The AI continuously extracts and updates a structured incident state, including:
+
+* **Location**
+* **Emergency type** (medical, police, fire, etc.)
+* **Injuries**
+* **Threat level**
+* **Number of people involved**
+* **Caller role** (victim, witness, bystander, etc.)
+
+The structured state evolves as more information is revealed during the call.
+
+---
+
+### 3. Missing Information Detection
+
+* Tracks which required fields are still unknown
+* Prioritizes high-impact gaps (e.g. missing location)
+* Understands dependencies between fields
+
+---
+
+### 4. Next Best Question Suggestion
+
+* Displays **exactly one question at a time**
+* Question is:
+
+  * Context-aware
+  * Urgency-driven
+  * Calm and dispatcher-appropriate
+* Updates dynamically as new information is received
+
+---
+
+### 5. Urgency Indicator
+
+* Real-time incident severity classification:
+
+  * **Low**
+  * **Medium**
+  * **Critical**
+* Based on extracted data and missing critical fields
+
+---
+
+### 6. Human-in-the-Loop Control
+
+* Dispatcher remains fully in control
+* Dispatcher can:
+
+  * Ignore AI suggestions
+  * Override extracted fields
+  * Proceed manually at any time
+* AI acts as an **assistant**, not a decision-maker
+
+---
+
+## Stretch Features (Optional)
+
+* Automatic post-call incident summary
+* Dispatcher tone modes (calm / assertive)
+* Explicit warnings when critical information is missing
+* Training and replay mode for dispatcher education
+* Multi-language transcription and extraction
+
+---
+
+## Technical Stack
+
+### Backend
+
+* **Node.js**
+* Handles:
+
+  * Audio/transcript ingestion
+  * LLM orchestration
+  * State management
+  * Real-time updates to frontend
+
+### Database & Realtime Sync
+
+* **Supabase**
+* Used for:
+
+  * Incident state storage
+  * Transcript storage
+  * Realtime subscriptions to update the UI
+  * Lightweight auth (if needed)
+
+### Speech-to-Text
+
+* **Deepgram**
+* Real-time streaming transcription
+* Partial + final transcript updates
+
+### AI / LLM
+
+* **Gemini**
+* Responsibilities:
+
+  * Structured data extraction
+  * Missing information reasoning
+  * Next best question generation
+* Invoked continuously as transcript updates arrive
+
+### Frontend
+
+* Web-based dispatcher dashboard (React or similar)
+* Real-time updates via Supabase Realtime or WebSockets
+* Minimal, calm, dispatcher-first UI
+
+---
+
+## Key Design Constraints
+
+* AI **augments dispatchers — it does not replace them**
+* The UI must prioritize **clarity and calm**
+* Only **one next best question** is shown at any time
+* Demo reliability > production completeness
+* The system should feel trustworthy, not intrusive
+
+---
+
+## Success Criteria for Demo
+
+* Live phone call works end-to-end
+* Transcription appears in near real time
+* Incident fields populate progressively
+* Missing critical info is clearly highlighted
+* The AI consistently suggests sensible next questions
+* Dispatcher UI feels helpful, not overwhelming
+
+---
+
+## Guiding Principle
+
+> *“Reduce chaos by turning noise into one clear next step.”*
