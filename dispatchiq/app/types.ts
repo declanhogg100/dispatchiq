@@ -17,3 +17,17 @@ export interface TranscriptMessage {
   isPartial?: boolean;
 }
 
+// Payload sent from the client to the analysis endpoint.
+export interface AnalysisRequestPayload {
+  messages: TranscriptMessage[];
+  incident: IncidentDetails;
+  urgency: Urgency;
+}
+
+// Structured response returned by the LLM-backed analysis endpoint.
+export interface AnalysisResponsePayload {
+  updates: Partial<IncidentDetails & { urgency: Urgency }>;
+  missing: (keyof IncidentDetails)[];
+  nextQuestion: string | null;
+  rawModelText?: string;
+}

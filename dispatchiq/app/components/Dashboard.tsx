@@ -1,11 +1,16 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { Header } from './Header';
 import { Transcript } from './Transcript';
 import { IncidentState } from './IncidentState';
 import { NextQuestion } from './NextQuestion';
-import { IncidentDetails, TranscriptMessage, Urgency } from '../types';
+import {
+  AnalysisResponsePayload,
+  IncidentDetails,
+  TranscriptMessage,
+  Urgency,
+} from '../types';
 
 // Mock scenario: Reporting a fire
 const MOCK_SCENARIO = [
@@ -40,6 +45,54 @@ export default function Dashboard() {
   const [urgency, setUrgency] = useState<Urgency>('Low');
   const [nextQuestion, setNextQuestion] = useState<string | null>(null);
   const [isSimulationRunning, setIsSimulationRunning] = useState(false);
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const lastAnalyzedIdRef = useRef<string | null>(null);
+  const debounceTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const DEBOUNCE_MS = 350;
+
+  const callAnalysisApi = useCallback(async () => {
+    const latestMessage = messages[messages.length - 1];
+    if (!latestMessage || latestMessage.isPartial) return;
+    if (lastAnalyzedIdRef.current === latestMessage.id) return;
+
+    setIsAnalyzing(true);
+    lastAnalyzedIdRef.current = latestMessage.id;
+
+    try {
+      const response = await fetch('/api/analyze', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          messages,
+          incident: incidentDetails,
+          urgency,
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`Analysis request failed: ${response.status}`);
+      }
+
+      const data = (await response.json()) as AnalysisResponsePayload;
+      const { updates, nextQuestion: suggestedQuestion } = data;
+
+      if (updates) {
+        const { urgency: updatedUrgency, ...fields } = updates;
+        if (updatedUrgency) setUrgency(updatedUrgency);
+        if (Object.keys(fields).length > 0) {
+          setIncidentDetails((prev) => ({ ...prev, ...fields }));
+        }
+      }
+
+      if (suggestedQuestion !== undefined) {
+        setNextQuestion(suggestedQuestion);
+      }
+    } catch (error) {
+      console.error(error);
+    } finally {
+      setIsAnalyzing(false);
+    }
+  }, [incidentDetails, messages, urgency]);
 
   const runSimulation = async () => {
     if (isSimulationRunning) return;
@@ -56,8 +109,7 @@ export default function Dashboard() {
     });
     setUrgency('Low');
     setNextQuestion(null);
-
-    let currentTime = 0;
+    lastAnalyzedIdRef.current = null;
 
     for (const step of MOCK_SCENARIO) {
       await new Promise(r => setTimeout(r, step.delay));
@@ -90,6 +142,21 @@ export default function Dashboard() {
     setStatus('connected');
   };
 
+  useEffect(() => {
+    if (debounceTimerRef.current) {
+      clearTimeout(debounceTimerRef.current);
+    }
+    debounceTimerRef.current = setTimeout(() => {
+      callAnalysisApi();
+    }, DEBOUNCE_MS);
+
+    return () => {
+      if (debounceTimerRef.current) {
+        clearTimeout(debounceTimerRef.current);
+      }
+    };
+  }, [messages, callAnalysisApi]);
+
   return (
     <div className="flex h-screen w-full flex-col bg-background">
       <Header status={status} />
@@ -105,7 +172,7 @@ export default function Dashboard() {
             
             {/* Top: Next Best Question (Hero) */}
             <div className="w-full">
-                <NextQuestion question={nextQuestion} loading={status === 'listening' && !nextQuestion} />
+                <NextQuestion question={nextQuestion} loading={isAnalyzing || (status === 'listening' && !nextQuestion)} />
             </div>
 
             {/* Middle: Incident State */}
@@ -133,4 +200,3 @@ export default function Dashboard() {
     </div>
   );
 }
-
