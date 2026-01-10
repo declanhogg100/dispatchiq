@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@deepgram/sdk": "^4.11.3",
+    "@supabase/supabase-js": "^2.90.1",
     "@types/express": "^5.0.6",
     "@types/ws": "^8.18.1",
     "clsx": "^2.1.1",
