@@ -128,7 +128,25 @@ export default function Dashboard() {
 
   // Subscribe to real-time transcripts via direct WebSocket connection to backend
   useEffect(() => {
-    const wsUrl = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:3001/dashboard';
+    const resolveWsUrl = () => {
+      let envUrl = process.env.NEXT_PUBLIC_WS_URL;
+      if (envUrl && typeof window !== 'undefined') {
+        // Prevent mixed-content: upgrade ws -> wss when the page is https
+        if (window.location.protocol === 'https:' && envUrl.startsWith('ws://')) {
+          envUrl = envUrl.replace('ws://', 'wss://');
+        }
+        return envUrl;
+      }
+      if (typeof window !== 'undefined') {
+        const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+        const host = window.location.hostname;
+        const port = (process.env.NEXT_PUBLIC_SERVER_PORT as string) || '3001';
+        return `${proto}://${host}:${port}/dashboard`;
+      }
+      return 'ws://localhost:3001/dashboard';
+    };
+
+    const wsUrl = resolveWsUrl();
     console.log('🔌 Connecting to backend WebSocket:', wsUrl);
     
     let ws: WebSocket | null = null;
@@ -229,13 +247,14 @@ export default function Dashboard() {
             }
         };
 
-        ws.onerror = (error) => {
-            console.error('❌ WebSocket error:', error);
+        ws.onerror = (event) => {
+            // Browser WebSocket onerror often lacks detail; log state and event
+            console.error('❌ WebSocket error', { readyState: ws?.readyState, event });
             setStatus('disconnected');
         };
 
-        ws.onclose = () => {
-            console.log('🔌 Disconnected from backend WebSocket');
+        ws.onclose = (evt) => {
+            console.log('🔌 Disconnected from backend WebSocket', { code: (evt as any)?.code, reason: (evt as any)?.reason });
             setStatus('disconnected');
             
             // Try to reconnect after 3 seconds

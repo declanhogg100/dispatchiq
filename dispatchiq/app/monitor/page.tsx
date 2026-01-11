@@ -287,6 +287,11 @@ export default function MonitorPage() {
           </div>
           
           <div className="flex items-center gap-3">
+            {aiModeEnabled && (
+              <div className="text-sm font-medium text-foreground">
+                (408) 767-6841
+              </div>
+            )}
             <button
               onClick={toggleAIMode}
               className={`px-4 py-2 rounded-lg font-medium text-sm transition-all ${
