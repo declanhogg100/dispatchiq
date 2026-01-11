@@ -5,8 +5,8 @@ import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 
 interface LeafletMapProps {
-  lat: number;
-  lon: number;
+  lat: number | null;
+  lon: number | null;
   stationLat: number | null;
   stationLon: number | null;
   routeGeometry: any;
@@ -37,6 +37,7 @@ export default function LeafletMap({ lat, lon, stationLat, stationLon, routeGeom
 
   useEffect(() => {
     if (!containerRef.current) return;
+    if (lat === null || lon === null) return; // require coords before initializing
 
     // Initialize map only once
     if (!mapRef.current) {
@@ -88,10 +89,8 @@ export default function LeafletMap({ lat, lon, stationLat, stationLon, routeGeom
       }).addTo(map);
 
       // Fit map to show entire route
-      const bounds = L.latLngBounds([
-        [lat, lon],
-        ...(stationLat && stationLon ? [[stationLat, stationLon]] : []),
-      ]);
+      const extraPoints: [number, number][] = (stationLat !== null && stationLon !== null) ? [[stationLat, stationLon]] : [];
+      const bounds = L.latLngBounds([[lat, lon], ...extraPoints]);
       map.fitBounds(bounds, { padding: [30, 30] });
     } else {
       // No route, just center on incident
@@ -109,4 +108,3 @@ export default function LeafletMap({ lat, lon, stationLat, stationLon, routeGeom
 
   return <div ref={containerRef} className="h-full w-full" />;
 }
-

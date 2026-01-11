@@ -248,9 +248,17 @@ export default function Dashboard() {
         };
 
         ws.onerror = (event) => {
-            // Browser WebSocket onerror often lacks detail; log state and event
-            console.error('❌ WebSocket error', { readyState: ws?.readyState, event });
+            // Browser WebSocket onerror often lacks detail; mark disconnected and trigger reconnect via close
+            const state = ws?.readyState;
+            const maybeMsg = (event as any)?.message || (event as any)?.reason || '';
+            console.warn(`⚠️ WebSocket error; state=${state}${maybeMsg ? `; message=${maybeMsg}` : ''}`);
             setStatus('disconnected');
+            try { ws?.close(); } catch {}
+            if (reconnectTimer) clearTimeout(reconnectTimer);
+            reconnectTimer = setTimeout(() => {
+                console.log('🔄 Reconnecting after error...');
+                connect();
+            }, 3000);
         };
 
         ws.onclose = (evt) => {

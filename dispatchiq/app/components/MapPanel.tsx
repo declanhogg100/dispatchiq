@@ -119,13 +119,19 @@ export function MapPanel({ lat, lon, etaMinutes, address, routeGeometry, station
         ) : null}
       </div>
       <div className="relative h-56 w-full overflow-hidden rounded-lg border">
-        <LeafletMap
-          lat={lat!}
-          lon={lon!}
-          stationLat={stationLat}
-          stationLon={stationLon}
-          routeGeometry={routeGeometry}
-        />
+        {lat !== null && lon !== null ? (
+          <LeafletMap
+            lat={lat}
+            lon={lon}
+            stationLat={stationLat}
+            stationLon={stationLon}
+            routeGeometry={routeGeometry}
+          />
+        ) : (
+          <div className="h-full w-full flex items-center justify-center bg-muted/30 text-xs text-muted-foreground">
+            Waiting for coordinates...
+          </div>
+        )}
         {showCalculating && (
           <div className="absolute inset-0 bg-background/50 backdrop-blur-[2px] flex items-center justify-center">
             <div className="bg-card border border-border rounded-lg p-3 shadow-lg flex items-center gap-2">

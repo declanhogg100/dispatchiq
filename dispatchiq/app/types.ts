@@ -86,3 +86,16 @@ export interface SimulationScenario {
   callerPersonality: string; // e.g., "panicked", "calm", "confused"
   initialMessage: string;
 }
+
+// AI Summary Types
+export interface SummaryRequestPayload {
+  messages: TranscriptMessage[];
+  incident: IncidentDetails;
+  urgency: Urgency;
+}
+
+export interface SummaryResponsePayload {
+  summary: string;
+  recommendations: string[]; // imperative action items like "Dispatch ambulance"
+  rawModelText?: string;
+}
