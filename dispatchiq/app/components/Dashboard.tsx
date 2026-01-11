@@ -5,6 +5,7 @@ import { Header } from './Header';
 import { Transcript } from './Transcript';
 import { IncidentState } from './IncidentState';
 import { NextQuestion } from './NextQuestion';
+import { MapPanel } from './MapPanel';
 import {
   AnalysisResponsePayload,
   IncidentDetails,
@@ -37,6 +38,8 @@ export default function Dashboard() {
   const [reportUrl, setReportUrl] = useState<string | null>(null);
   const [showReportButton, setShowReportButton] = useState(false);
   const [isGeneratingReport, setIsGeneratingReport] = useState(false);
+  const [etaMinutes, setEtaMinutes] = useState<number | null>(null);
+  const [coords, setCoords] = useState<{ lat: number; lon: number } | null>(null);
 
   // Subscribe to real-time transcripts via direct WebSocket connection to backend
   useEffect(() => {
@@ -216,6 +219,29 @@ export default function Dashboard() {
     };
   }, [messages, callAnalysisApi]);
 
+  // Fetch ETA when location changes
+  useEffect(() => {
+    const fetchEta = async () => {
+      if (!incidentDetails.location) {
+        setEtaMinutes(null);
+        setCoords(null);
+        return;
+      }
+      try {
+        const res = await fetch(`/api/police-eta?address=${encodeURIComponent(incidentDetails.location)}`);
+        if (!res.ok) return;
+        const data = await res.json();
+        setEtaMinutes(data.etaMinutes ?? null);
+        if (data.lat && data.lon) {
+          setCoords({ lat: data.lat, lon: data.lon });
+        }
+      } catch (error) {
+        console.error('ETA fetch failed', error);
+      }
+    };
+    fetchEta();
+  }, [incidentDetails.location]);
+
   return (
     <div className="flex h-screen w-full flex-col bg-background">
       <Header status={status} />
@@ -243,6 +269,16 @@ export default function Dashboard() {
                   onDetailsUpdate={(updates) => setIncidentDetails(prev => ({ ...prev, ...updates }))}
                   onUrgencyUpdate={(newUrgency) => setUrgency(newUrgency)}
                 />
+            </div>
+
+            {/* Map + ETA */}
+            <div className="rounded-xl border border-border bg-card p-4 shadow-sm">
+              <MapPanel
+                lat={coords?.lat ?? null}
+                lon={coords?.lon ?? null}
+                etaMinutes={etaMinutes}
+                address={incidentDetails.location}
+              />
             </div>
 
             {/* Report Generation Button (pops up when call ends) */}
