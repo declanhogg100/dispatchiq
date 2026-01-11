@@ -6,8 +6,16 @@ import {
   TranscriptMessage,
   Urgency,
 } from '@/app/types';
+import { createClient } from '@supabase/supabase-js';
 
 const GEMINI_MODEL = process.env.GEMINI_MODEL_ID ?? 'gemini-2.5-flash';
+const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const supabase =
+  SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
+    ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+    : null;
+
 const REQUIRED_FIELDS: (keyof IncidentDetails)[] = [
   'location',
   'type',
@@ -28,6 +36,7 @@ export async function POST(req: Request) {
   const messages = normalizeMessages(body?.messages ?? []);
   const incident = body?.incident;
   const urgency = body?.urgency ?? 'Low';
+  const callSid = body?.callSid;
 
   if (!incident) {
     return NextResponse.json({ error: 'Missing incident payload' }, { status: 400 });
@@ -35,6 +44,45 @@ export async function POST(req: Request) {
 
   try {
     const result = await runGeminiAnalysis(messages, incident, urgency);
+    
+    // Save to database if Supabase is configured and callSid is present
+    if (supabase && callSid && result.updates) {
+        // We only want to save if there are actual updates to incident fields or urgency
+        // Or we can just save the latest state every time analysis runs (easier)
+        const newIncidentState = { ...incident, ...result.updates };
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
+        const { urgency: newUrgency, ...fields } = result.updates;
+        const finalUrgency = newUrgency || urgency;
+
+        // Upsert into incidents table
+        // We need the call_id. But wait, incidents table uses call_id (UUID) and call_sid (TEXT).
+        // call_sid is unique in calls table.
+        // We can look up call_id using call_sid.
+        
+        // Find call_id
+        const { data: callData } = await supabase
+            .from('calls')
+            .select('id')
+            .eq('call_sid', callSid)
+            .single();
+            
+        if (callData) {
+            await supabase.from('incidents').upsert({
+                call_id: callData.id,
+                call_sid: callSid,
+                location: newIncidentState.location,
+                type: newIncidentState.type,
+                injuries: newIncidentState.injuries,
+                threat_level: newIncidentState.threatLevel,
+                people_count: newIncidentState.peopleCount,
+                caller_role: newIncidentState.callerRole,
+                urgency: finalUrgency,
+                next_question: result.nextQuestion,
+                updated_at: new Date().toISOString()
+            }, { onConflict: 'call_sid' });
+        }
+    }
+
     return NextResponse.json(result);
   } catch (error) {
     console.error('Gemini analysis failed; falling back to heuristic output', error);

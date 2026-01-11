@@ -475,6 +475,13 @@ wss.on('connection', (ws: WSType, req) => {
           // End call record in Supabase
           await endCallRecord(msg.stop.callSid);
 
+          // Broadcast call ended to dashboard
+          broadcastToDashboard({
+            type: 'call_ended',
+            call_sid: msg.stop.callSid,
+            timestamp: new Date().toISOString()
+          });
+          
           // Clean up Deepgram connection
           if (deepgramConnection) {
             deepgramConnection.finish();
@@ -786,7 +793,7 @@ async function generateReport(callSid: string, state: CallState) {
 }
 
 // Start server
-httpServer.listen(PORT, () => {
+httpServer.listen(Number(PORT), '0.0.0.0', () => {
   console.log('\n🚨 DispatchIQ Server');
   console.log('================================');
   console.log(`✅ HTTP Server: http://localhost:${PORT}`);

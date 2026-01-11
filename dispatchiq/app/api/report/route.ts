@@ -53,11 +53,58 @@ export const dynamic = 'force-dynamic';
 
 export async function POST(req: Request) {
   const body = (await req.json()) as ReportRequestPayload;
-  const messages = normalizeMessages(body?.messages ?? []);
-  const incident = body?.incident;
-  const urgency = body?.urgency ?? 'Low';
+  let messages = normalizeMessages(body?.messages ?? []);
+  let incident = body?.incident;
+  let urgency = body?.urgency ?? 'Low';
   const format =
     (req.url && new URL(req.url).searchParams.get('format')) || 'json';
+  const callId = body?.callId;
+
+  // If messages or incident missing, try to fetch from Supabase if callId is present
+  if ((!incident || messages.length === 0) && callId && supabase) {
+    // Fetch call details + transcripts
+    const { data: callData, error: callError } = await supabase
+      .from('calls')
+      .select('*, incidents(*)')
+      .eq('id', callId)
+      .single();
+
+    if (!callError && callData) {
+        // Hydrate incident
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const incidentRow = (callData as any).incidents?.[0];
+        if (!incident && incidentRow) {
+            incident = {
+                location: incidentRow.location,
+                type: incidentRow.type,
+                injuries: incidentRow.injuries,
+                threatLevel: incidentRow.threat_level,
+                peopleCount: incidentRow.people_count,
+                callerRole: incidentRow.caller_role,
+            };
+            urgency = incidentRow.urgency || 'Low';
+        }
+        
+        // Hydrate messages
+        if (messages.length === 0) {
+            const { data: transcriptsData } = await supabase
+                .from('transcripts')
+                .select('*')
+                .eq('call_id', callId)
+                .order('created_at', { ascending: true });
+            
+            if (transcriptsData) {
+                messages = normalizeMessages(transcriptsData.map((t: any) => ({
+                    id: t.id,
+                    sender: t.sender,
+                    text: t.text,
+                    timestamp: t.created_at,
+                    isPartial: t.is_partial
+                })));
+            }
+        }
+    }
+  }
 
   if (!incident) {
     return NextResponse.json({ error: 'Missing incident payload' }, { status: 400 });
@@ -71,7 +118,15 @@ export async function POST(req: Request) {
       body,
     );
 
-    const pdfBuffer = await renderPdf(report);
+    const fullTranscript = messages
+      .map((msg) => {
+        const time = msg.timestamp ? new Date(msg.timestamp).toISOString() : '';
+        const speaker = msg.sender === 'dispatcher' ? 'DISPATCHER' : 'CALLER';
+        return `[${time}] ${speaker}: ${msg.text}`;
+      })
+      .join('\n');
+
+    const pdfBuffer = await renderPdf(report, fullTranscript);
     const uploadResult = await uploadPdf(pdfBuffer, body);
 
     if (format === 'pdf') {
@@ -250,7 +305,7 @@ function parseModelJson(text: string): ReportContent | null {
   }
 }
 
-async function renderPdf(report: ReportContent): Promise<Buffer> {
+async function renderPdf(report: ReportContent, fullTranscript: string): Promise<Buffer> {
   // Dynamically load pdfkit (standalone build) to avoid build-time bundling issues
   const { default: PDFDocument } = await import('pdfkit/js/pdfkit.standalone.js');
 
@@ -273,8 +328,8 @@ async function renderPdf(report: ReportContent): Promise<Buffer> {
     doc.text(`Received (UTC): ${h.received_utc || 'Not available'}`);
     doc.text(`Received (Local): ${h.received_local || 'Not available'}`);
     doc.text(`Duration (s): ${h.duration_seconds || 'Not available'}`);
-    doc.text(`Dispatcher ID: ${h.dispatcher_id || 'Not available'}`);
-    doc.text(`Recording ID: ${h.recording_id || 'Not available'}`);
+    // doc.text(`Dispatcher ID: ${h.dispatcher_id || 'Not available'}`);
+    // doc.text(`Recording ID: ${h.recording_id || 'Not available'}`);
 
     doc.moveDown(1);
     doc.fontSize(14).text('Incident Summary', { underline: true });
@@ -300,6 +355,7 @@ async function renderPdf(report: ReportContent): Promise<Buffer> {
       });
     }
 
+    /*
     // Dispatcher actions
     if (report.dispatcher_actions?.length) {
       doc.moveDown(1);
@@ -309,6 +365,7 @@ async function renderPdf(report: ReportContent): Promise<Buffer> {
         doc.text(`• ${action}`);
       });
     }
+    */
 
     // Outcome
     doc.moveDown(1);
@@ -340,10 +397,18 @@ async function renderPdf(report: ReportContent): Promise<Buffer> {
           report.attachments.transcript_reference || 'Not available'
         }`,
       );
-      doc.text(`Model: ${report.attachments.model || 'Not available'}`);
-      doc.text(
-        `Generated at: ${report.attachments.generated_at || 'Not available'}`,
-      );
+      // doc.text(`Model: ${report.attachments.model || 'Not available'}`);
+      // doc.text(
+      //   `Generated at: ${report.attachments.generated_at || 'Not available'}`,
+      // );
+    }
+
+    // Full Transcript
+    if (fullTranscript) {
+      doc.addPage();
+      doc.fontSize(14).text('Full Transcript', { underline: true });
+      doc.moveDown(1);
+      doc.fontSize(10).text(fullTranscript);
     }
 
     doc.end();
@@ -359,7 +424,7 @@ async function uploadPdf(
   }
 
   const callId = (meta.callId || 'call').replace(/\s+/g, '-');
-  const filePath = `${callId}/${Date.now()}.pdf`;
+  const filePath = `${callId}/report.pdf`;
 
   const { error } = await supabase.storage
     .from(REPORT_BUCKET)
