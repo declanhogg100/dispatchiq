@@ -21,32 +21,36 @@ import express from 'express';
 import { createServer } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
 import { createClient as createSupabaseClient } from '@supabase/supabase-js';
+import { createClient as createDeepgramClient, LiveTranscriptionEvents } from '@deepgram/sdk';
 import type { WebSocket as WSType } from 'ws';
 
 // Environment variables
 const PORT = process.env.PORT || 3001;
 const PUBLIC_HOST = process.env.PUBLIC_HOST;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const DISPATCHER_PHONE = process.env.DISPATCHER_PHONE;
 
-// OpenAI Realtime API config
-// Try these model names if one doesn't work:
-//   gpt-4o-realtime-preview-2024-12-17  (older, but widely available)
-//   gpt-4o-realtime-preview             (latest preview)
-//   gpt-4o-mini-realtime-preview-2024-12-17  (cheaper, might have wider access)
+// OpenAI Realtime API config (only used for AI Agent mode)
 const OPENAI_MODEL = process.env.OPENAI_REALTIME_MODEL || 'gpt-4o-realtime-preview-2024-12-17';
 const OPENAI_REALTIME_URL = `wss://api.openai.com/v1/realtime?model=${OPENAI_MODEL}`;
-const VOICE = process.env.OPENAI_VOICE || 'alloy'; // Options: alloy, echo, shimmer (avoid fable, onyx, nova with Twilio)
+const VOICE = process.env.OPENAI_VOICE || 'alloy';
 
+// Validate required API keys
 if (!OPENAI_API_KEY) {
-  console.error('❌ OPENAI_API_KEY is required');
+  console.error('❌ OPENAI_API_KEY is required for AI Agent mode');
   process.exit(1);
 }
 
-console.log(`🤖 OpenAI Realtime Model: ${OPENAI_MODEL}`);
-console.log(`   If you get "model not found" errors, try setting OPENAI_REALTIME_MODEL in .env.local`);
+if (!DEEPGRAM_API_KEY) {
+  console.error('❌ DEEPGRAM_API_KEY is required for human dispatcher transcription');
+  process.exit(1);
+}
+
+console.log(`🤖 OpenAI Realtime Model: ${OPENAI_MODEL} (for AI Agent mode)`);
+console.log(`🎤 Deepgram enabled (for human dispatcher transcription)`);
 
 if (!PUBLIC_HOST) {
   console.warn('⚠️  PUBLIC_HOST not set. Make sure to configure Twilio with your actual WebSocket URL.');
@@ -320,7 +324,7 @@ const callStateMap = new Map<string, CallState>();
 // Track last geocoded address per call to avoid duplicate lookups
 const lastGeocodedAddress = new Map<string, string>();
 
-// Store active OpenAI connections per call
+// Store active OpenAI connections per call (AI Agent mode only)
 interface CallSession {
   twilioWs: WSType;
   openaiWs: WebSocket;
@@ -329,6 +333,9 @@ interface CallSession {
   isAiMode: boolean;  // Track if this call is in AI mode
 }
 const callSessionMap = new Map<string, CallSession>();
+
+// Store active Deepgram connections per call (Human Dispatcher mode only)
+const deepgramConnectionMap = new Map<string, any>();
 
 // Store active real AI calls for the AI monitor (real Twilio calls when AI mode is ON)
 interface AIMonitorCall {
@@ -893,50 +900,54 @@ function sleep(ms: number): Promise<void> {
 }
 
 // Twilio Voice Webhook - Returns TwiML based on AI mode
+// AI Mode ON: Bidirectional stream to OpenAI for AI agent
+// AI Mode OFF: Fork stream to Deepgram for transcription + dial human dispatcher
 app.all('/twilio/voice', (req, res) => {
   console.log(`📞 Incoming ${req.method} request to /twilio/voice`);
-  console.log(`   AI Mode: ${aiModeEnabled ? 'ON' : 'OFF'}`);
+  console.log(`   AI Mode: ${aiModeEnabled ? 'ON (AI Agent)' : 'OFF (Human Dispatcher)'}`);
+  
+  const websocketUrl = PUBLIC_HOST 
+    ? `wss://${PUBLIC_HOST}/twilio/media`
+    : `wss://YOUR_NGROK_URL_HERE/twilio/media`;
   
   let twiml: string;
   
   if (aiModeEnabled) {
-    // AI Agent mode - bidirectional audio via <Connect><Stream>
-    const websocketUrl = PUBLIC_HOST 
-      ? `wss://${PUBLIC_HOST}/twilio/media`
-      : `wss://YOUR_NGROK_URL_HERE/twilio/media`;
-    
-    console.log('🤖 AI mode: Caller will interact with OpenAI Realtime API');
+    // AI Agent mode - bidirectional stream to OpenAI Realtime API
+    console.log(`🤖 AI Mode: Connecting to OpenAI Realtime API`);
+    console.log(`   Stream URL: ${websocketUrl}`);
     twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
     <Stream url="${websocketUrl}" />
   </Connect>
 </Response>`;
-    console.log('✅ TwiML response sent with WebSocket URL:', websocketUrl);
   } else {
-    // Human dispatcher mode - dial the dispatcher phone
+    // Human Dispatcher mode - fork stream for transcription + dial dispatcher
     if (!DISPATCHER_PHONE) {
-      console.error('❌ DISPATCHER_PHONE not set in environment!');
+      console.error('❌ DISPATCHER_PHONE not set - cannot route to human dispatcher');
       twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say>Sorry, no dispatcher is available at this time. Please try again later.</Say>
-  <Hangup/>
+  <Say voice="Polly.Joanna">I'm sorry, the dispatcher is currently unavailable. Please try again later.</Say>
 </Response>`;
     } else {
-      console.log(`📞 Human mode: Connecting caller to dispatcher at ${DISPATCHER_PHONE}`);
+      console.log(`👤 Human Mode: Dialing ${DISPATCHER_PHONE} + streaming to Deepgram`);
+      console.log(`   Stream URL: ${websocketUrl}`);
+      // <Start><Stream> forks the audio to our server for Deepgram transcription
+      // <Dial> connects the caller to the human dispatcher
       twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say>Please hold while we connect you to a dispatcher.</Say>
-  <Dial record="record-from-answer-dual" recordingStatusCallback="/twilio/recording">
-    <Number>${DISPATCHER_PHONE}</Number>
-  </Dial>
+  <Start>
+    <Stream url="${websocketUrl}" />
+  </Start>
+  <Dial>${DISPATCHER_PHONE}</Dial>
 </Response>`;
-      console.log('✅ TwiML response sent - dialing dispatcher');
     }
   }
 
   res.set('Content-Type', 'text/xml');
   res.send(twiml);
+  console.log('✅ TwiML response sent');
 });
 
 // Optional: Receive precise device geolocation from a mobile app and broadcast to dashboard
@@ -973,9 +984,77 @@ app.post('/twilio/location', express.json(), (req, res) => {
   }
 });
 
-// Connect to OpenAI Realtime API
+// Initialize Deepgram live transcription for human dispatcher calls
+async function initDeepgramConnection(callSid: string) {
+  console.log(`🎤 Initializing Deepgram for call: ${callSid}`);
+
+  const deepgram = createDeepgramClient(DEEPGRAM_API_KEY!);
+
+  const connection = deepgram.listen.live({
+    encoding: 'mulaw',
+    sample_rate: 8000,
+    channels: 1,
+    punctuate: true,
+    interim_results: true,
+    smart_format: true,
+    model: 'nova-2',
+  });
+
+  // Handle transcript events
+  connection.on(LiveTranscriptionEvents.Open, () => {
+    console.log(`✅ Deepgram connection opened for call: ${callSid}`);
+  });
+
+  connection.on(LiveTranscriptionEvents.Transcript, async (data: any) => {
+    const transcript = data.channel?.alternatives?.[0]?.transcript;
+    
+    if (!transcript) return;
+
+    const isFinal = data.is_final;
+    const confidence = data.channel?.alternatives?.[0]?.confidence;
+
+    if (isFinal) {
+      console.log(`📝 [FINAL] Call ${callSid}: "${transcript}"`);
+      
+      // Store transcript and broadcast to human dashboard
+      await storeTranscript(callSid, 'caller', transcript, true, confidence);
+      
+      // Update call state and trigger analysis
+      const state = callStateMap.get(callSid);
+      if (state) {
+        state.messages.push({
+          id: Date.now().toString(),
+          sender: 'caller',
+          text: transcript,
+          timestamp: new Date(),
+          isPartial: false
+        });
+        
+        // Run analysis in background
+        void analyzeAndBroadcast(callSid, state);
+      }
+    } else {
+      // Partial transcript - useful for real-time UI updates
+      console.log(`⏳ [PARTIAL] Call ${callSid}: "${transcript}"`);
+      // Optionally broadcast partial transcripts for UI responsiveness
+      // await storeTranscript(callSid, 'caller', transcript, false, confidence);
+    }
+  });
+
+  connection.on(LiveTranscriptionEvents.Error, (error: any) => {
+    console.error(`❌ Deepgram error for call ${callSid}:`, error);
+  });
+
+  connection.on(LiveTranscriptionEvents.Close, () => {
+    console.log(`🔌 Deepgram connection closed for call: ${callSid}`);
+  });
+
+  return connection;
+}
+
+// Connect to OpenAI Realtime API (AI Agent mode only)
 function connectToOpenAI(callSid: string, streamSid: string, twilioWs: WSType): WebSocket {
-  console.log(`🔌 Connecting to OpenAI Realtime API for call: ${callSid}`);
+  console.log(`🤖 Connecting to OpenAI Realtime API for AI agent: ${callSid}`);
   console.log(`   URL: ${OPENAI_REALTIME_URL}`);
   
   const openaiWs = new WebSocket(OPENAI_REALTIME_URL, {
@@ -988,7 +1067,7 @@ function connectToOpenAI(callSid: string, streamSid: string, twilioWs: WSType): 
   openaiWs.on('open', () => {
     console.log(`✅ OpenAI Realtime connection opened for call: ${callSid}`);
     
-    // Configure the session - must match Twilio's mulaw format
+    // Configure the session for AI agent mode
     const sessionConfig = {
       type: 'session.update',
       session: {
@@ -1009,12 +1088,11 @@ function connectToOpenAI(callSid: string, streamSid: string, twilioWs: WSType): 
       }
     };
     
-    console.log(`📤 Sending session config:`, JSON.stringify(sessionConfig.session, null, 2));
+    console.log(`📤 Sending session config`);
     openaiWs.send(JSON.stringify(sessionConfig));
 
-    // Send initial greeting by creating a conversation item first
+    // Send initial greeting
     setTimeout(() => {
-      // Method 1: Create a user message to trigger AI response
       const conversationItem = {
         type: 'conversation.item.create',
         item: {
@@ -1031,7 +1109,6 @@ function connectToOpenAI(callSid: string, streamSid: string, twilioWs: WSType): 
       openaiWs.send(JSON.stringify(conversationItem));
       console.log(`📤 Sent conversation item to trigger greeting`);
 
-      // Then request a response
       setTimeout(() => {
         const responseCreate = {
           type: 'response.create'
@@ -1062,7 +1139,7 @@ function connectToOpenAI(callSid: string, streamSid: string, twilioWs: WSType): 
   return openaiWs;
 }
 
-// Handle events from OpenAI Realtime API
+// Handle events from OpenAI Realtime API (AI Agent mode only)
 function handleOpenAIEvent(callSid: string, streamSid: string, twilioWs: WSType, event: any) {
   const eventType = event.type;
   
@@ -1078,8 +1155,9 @@ function handleOpenAIEvent(callSid: string, streamSid: string, twilioWs: WSType,
     case 'response.audio.delta':
       // Stream audio back to Twilio
       if (event.delta) {
-        // Track audio chunks for debugging
         const session = callSessionMap.get(callSid);
+        
+        // Track audio chunks for debugging
         if (session) {
           (session as any).audioChunksSent = ((session as any).audioChunksSent || 0) + 1;
           if ((session as any).audioChunksSent === 1) {
@@ -1090,16 +1168,16 @@ function handleOpenAIEvent(callSid: string, streamSid: string, twilioWs: WSType,
         }
 
         const audioMessage = {
-    event: 'media',
+          event: 'media',
           streamSid: streamSid,
-    media: {
+          media: {
             payload: event.delta // Already base64 encoded g711_ulaw
           }
         };
         
         if (twilioWs.readyState === WebSocket.OPEN) {
           twilioWs.send(JSON.stringify(audioMessage));
-    } else {
+        } else {
           console.warn(`⚠️  Twilio WebSocket not open (state: ${twilioWs.readyState})`);
         }
       }
@@ -1210,8 +1288,10 @@ wss.on('connection', (ws: WSType, req) => {
   let callSid: string | null = null;
   let streamSid: string | null = null;
   let openaiWs: WebSocket | null = null;
+  let deepgramConnection: any = null;
   let messageCount = 0;
   let audioPacketCount = 0;
+  let isThisCallAiMode = false;
 
   ws.on('message', async (message: Buffer) => {
     messageCount++;
@@ -1225,12 +1305,12 @@ wss.on('connection', (ws: WSType, req) => {
           streamSid = msg.start.streamSid;
           
           // Check if AI mode is enabled for this call
-          const isThisCallAiMode = aiModeEnabled;
+          isThisCallAiMode = aiModeEnabled;
           
           console.log(`🚨 Call started: ${callSid}`);
           console.log(`   Stream SID: ${streamSid}`);
           console.log(`   Media format: ${msg.start.mediaFormat.encoding} @ ${msg.start.mediaFormat.sampleRate}Hz`);
-          console.log(`   AI Mode: ${isThisCallAiMode ? 'ON (routing to AI Monitor)' : 'OFF (routing to Human Dispatcher)'}`);
+          console.log(`   Mode: ${isThisCallAiMode ? '🤖 AI Agent (OpenAI)' : '👤 Human Dispatcher (Deepgram)'}`);
 
           // Create call record in Supabase
           await createCallRecord(callSid, streamSid);
@@ -1251,8 +1331,8 @@ wss.on('connection', (ws: WSType, req) => {
             isAiMode: isThisCallAiMode,
           });
 
-          // If AI mode is enabled, create an AI monitor call entry
           if (isThisCallAiMode) {
+            // AI Agent mode - connect to OpenAI Realtime API
             const aiCall: AIMonitorCall = {
               callSid: callSid,
               scenario: 'Live Emergency Call',
@@ -1283,35 +1363,56 @@ wss.on('connection', (ws: WSType, req) => {
             broadcastToAiMonitor({ type: 'ai_call_update', call: aiCall });
             
             console.log(`🖥️  New AI call added to monitor: ${callSid}`);
-          }
 
-          // Connect to OpenAI Realtime API
-          openaiWs = connectToOpenAI(callSid, streamSid, ws);
-          callSessionMap.set(callSid, {
-            twilioWs: ws,
-            openaiWs: openaiWs,
-            streamSid: streamSid,
-            callSid: callSid,
-            isAiMode: isThisCallAiMode,
-          });
+            // Connect to OpenAI Realtime API for AI agent
+            openaiWs = connectToOpenAI(callSid, streamSid, ws);
+            callSessionMap.set(callSid, {
+              twilioWs: ws,
+              openaiWs: openaiWs,
+              streamSid: streamSid,
+              callSid: callSid,
+              isAiMode: true,
+            });
+          } else {
+            // Human Dispatcher mode - connect to Deepgram for transcription
+            deepgramConnection = await initDeepgramConnection(callSid);
+            deepgramConnectionMap.set(callSid, deepgramConnection);
+            
+            // Notify the live dashboard that a call started
+            broadcastToDashboard({
+              type: 'call_started',
+              call_sid: callSid,
+              timestamp: new Date().toISOString(),
+            });
+            console.log(`📞 Human dispatcher call started: ${callSid}`);
+          }
           break;
 
         case 'media':
-          // Forward audio to OpenAI
-          if (openaiWs && openaiWs.readyState === WebSocket.OPEN && msg.media.payload) {
+          if (msg.media.payload) {
             audioPacketCount++;
             
             // Log every 100 packets
             if (audioPacketCount % 100 === 0) {
-              console.log(`🎵 Audio packets forwarded to OpenAI: ${audioPacketCount}`);
+              console.log(`🎵 Audio packets forwarded: ${audioPacketCount} (${isThisCallAiMode ? 'OpenAI' : 'Deepgram'})`);
             }
             
-            // Send audio to OpenAI (already base64 encoded mulaw from Twilio)
-            const audioAppend = {
-              type: 'input_audio_buffer.append',
-              audio: msg.media.payload
-            };
-            openaiWs.send(JSON.stringify(audioAppend));
+            if (isThisCallAiMode) {
+              // AI mode - forward audio to OpenAI
+              if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+                const audioAppend = {
+                  type: 'input_audio_buffer.append',
+                  audio: msg.media.payload
+                };
+                openaiWs.send(JSON.stringify(audioAppend));
+              }
+            } else {
+              // Human mode - forward audio to Deepgram
+              if (deepgramConnection) {
+                const audioBuffer = Buffer.from(msg.media.payload, 'base64');
+                deepgramConnection.send(audioBuffer);
+              }
+            }
           }
           break;
 
@@ -1325,7 +1426,6 @@ wss.on('connection', (ws: WSType, req) => {
           // End call record in Supabase
           await endCallRecord(msg.stop.callSid);
 
-          // Broadcast call ended to appropriate dashboard
           if (wasAiModeCall) {
             // Update AI monitor call status
             const aiCall = aiCallsMap.get(msg.stop.callSid);
@@ -1339,21 +1439,33 @@ wss.on('connection', (ws: WSType, req) => {
               });
             }
             console.log(`🖥️  AI call ended: ${msg.stop.callSid}`);
-    } else {
+            
+            // Clean up OpenAI connection
+            const session = callSessionMap.get(msg.stop.callSid);
+            if (session?.openaiWs) {
+              session.openaiWs.close();
+            }
+            callSessionMap.delete(msg.stop.callSid);
+            
+            // Clean up AI call map (keep for 5 min for review)
+            setTimeout(() => {
+              aiCallsMap.delete(msg.stop.callSid);
+            }, 5 * 60 * 1000);
+          } else {
             // Broadcast to human dispatcher dashboard
             broadcastToDashboard({
               type: 'call_ended',
               call_sid: msg.stop.callSid,
               timestamp: new Date().toISOString()
             });
+            
+            // Clean up Deepgram connection
+            const dgConn = deepgramConnectionMap.get(msg.stop.callSid);
+            if (dgConn) {
+              dgConn.finish();
+              deepgramConnectionMap.delete(msg.stop.callSid);
+            }
           }
-          
-          // Clean up OpenAI connection
-          const session = callSessionMap.get(msg.stop.callSid);
-          if (session?.openaiWs) {
-            session.openaiWs.close();
-          }
-          callSessionMap.delete(msg.stop.callSid);
 
           // Generate final report
           const finalState = callStateMap.get(msg.stop.callSid);
@@ -1361,19 +1473,12 @@ wss.on('connection', (ws: WSType, req) => {
             void generateReport(msg.stop.callSid, finalState);
           }
           callStateMap.delete(msg.stop.callSid);
-          
-          // Clean up AI call map (keep for a bit for review, then remove after 5 min)
-          if (wasAiModeCall) {
-            setTimeout(() => {
-              aiCallsMap.delete(msg.stop.callSid);
-            }, 5 * 60 * 1000);
-          }
           break;
 
         default:
           console.log('📨 Unknown Twilio event:', (msg as any).event);
-    }
-  } catch (error) {
+      }
+    } catch (error) {
       console.error('❌ Error processing Twilio message:', error);
     }
   });
@@ -1381,26 +1486,42 @@ wss.on('connection', (ws: WSType, req) => {
   ws.on('close', () => {
     console.log('🔌 Twilio WebSocket disconnected');
     
-    // Clean up OpenAI connection
     if (callSid) {
-      const session = callSessionMap.get(callSid);
-      if (session?.openaiWs) {
-        session.openaiWs.close();
+      if (isThisCallAiMode) {
+        // Clean up OpenAI connection
+        const session = callSessionMap.get(callSid);
+        if (session?.openaiWs) {
+          session.openaiWs.close();
+        }
+        callSessionMap.delete(callSid);
+      } else {
+        // Clean up Deepgram connection
+        const dgConn = deepgramConnectionMap.get(callSid);
+        if (dgConn) {
+          dgConn.finish();
+          deepgramConnectionMap.delete(callSid);
+        }
       }
-      callSessionMap.delete(callSid);
     }
   });
 
   ws.on('error', (error) => {
     console.error('❌ Twilio WebSocket error:', error);
     
-    // Clean up on error
     if (callSid) {
-      const session = callSessionMap.get(callSid);
-      if (session?.openaiWs) {
-        session.openaiWs.close();
+      if (isThisCallAiMode) {
+        const session = callSessionMap.get(callSid);
+        if (session?.openaiWs) {
+          session.openaiWs.close();
+        }
+        callSessionMap.delete(callSid);
+      } else {
+        const dgConn = deepgramConnectionMap.get(callSid);
+        if (dgConn) {
+          dgConn.finish();
+          deepgramConnectionMap.delete(callSid);
+        }
       }
-      callSessionMap.delete(callSid);
     }
   });
 });

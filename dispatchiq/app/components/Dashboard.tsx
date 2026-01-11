@@ -144,6 +144,17 @@ export default function Dashboard() {
             try {
                 const data = JSON.parse(event.data);
 
+                // Handle new call started
+                if (data.type === 'call_started') {
+                    console.log('📞 New call started:', data.call_sid);
+                    setCurrentCallSid(data.call_sid);
+                    setStatus('listening');
+                    setShowReportButton(false);
+                    setReportUrl(null);
+                    setReport(null);
+                    endedCallSidRef.current = null;
+                }
+
                 if (data.type === 'transcript') {
                     const message: TranscriptMessage = {
                         id: data.id,
