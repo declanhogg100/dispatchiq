@@ -52,3 +52,37 @@ export interface ReportResponsePayload {
   storagePath?: string;
   publicUrl?: string | null;
 }
+
+// AI Call Monitoring Types
+export type AICallStatus = 'active' | 'completed' | 'pending_action';
+
+export interface AICallAction {
+  id: string;
+  type: 'dispatch' | 'escalate' | 'transfer' | 'info';
+  description: string;
+  units?: string; // e.g., "2 police cars", "1 ambulance"
+  location?: string;
+  status: 'pending' | 'approved' | 'rejected';
+  timestamp: Date;
+}
+
+export interface AICall {
+  id: string;
+  callSid: string;
+  scenario: string;
+  status: AICallStatus;
+  urgency: Urgency;
+  incident: IncidentDetails;
+  messages: TranscriptMessage[];
+  actions: AICallAction[];
+  startedAt: Date;
+  endedAt?: Date;
+}
+
+// Simulation scenarios
+export interface SimulationScenario {
+  name: string;
+  description: string;
+  callerPersonality: string; // e.g., "panicked", "calm", "confused"
+  initialMessage: string;
+}

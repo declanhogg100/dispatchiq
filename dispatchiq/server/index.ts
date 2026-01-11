@@ -190,6 +190,35 @@ type TwilioMessage = TwilioStartMessage | TwilioMediaMessage | TwilioStopMessage
 // Store call IDs mapping (callSid -> database call_id)
 const callIdMap = new Map<string, string>();
 
+// AI Mode flag - when true, next real call goes to AI monitor instead of live dashboard
+let aiModeEnabled = false;
+
+// Store active AI simulation calls
+interface AISimulationCall {
+  callSid: string;
+  scenario: string;
+  personality: string;
+  context: string;
+  messages: TranscriptMessage[];
+  incident: IncidentDetails;
+  urgency: Urgency;
+  actions: AICallAction[];
+  status: 'active' | 'completed' | 'pending_action';
+  startedAt: Date;
+}
+
+interface AICallAction {
+  id: string;
+  type: 'dispatch' | 'escalate' | 'transfer' | 'info';
+  description: string;
+  units?: string;
+  location?: string;
+  status: 'pending' | 'approved' | 'rejected';
+  timestamp: Date;
+}
+
+const aiSimulationCalls = new Map<string, AISimulationCall>();
+
 // Simple state tracking per call
 type Urgency = 'Low' | 'Medium' | 'Critical';
 interface IncidentDetails {
@@ -366,6 +395,386 @@ async function endCallRecord(callSid: string) {
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
+
+// ===== AI MODE & SIMULATION ENDPOINTS =====
+
+// Get/Set AI Mode
+app.get('/api/ai-mode', (req, res) => {
+  res.json({ aiModeEnabled });
+});
+
+app.post('/api/ai-mode', (req, res) => {
+  const { enabled } = req.body;
+  aiModeEnabled = Boolean(enabled);
+  console.log(`🤖 AI Mode ${aiModeEnabled ? 'ENABLED' : 'DISABLED'}`);
+  res.json({ success: true, aiModeEnabled });
+});
+
+// Handle action approval
+app.post('/api/action', (req, res) => {
+  const { callSid, actionId, decision } = req.body;
+  
+  const simCall = aiSimulationCalls.get(callSid);
+  if (simCall) {
+    const action = simCall.actions.find(a => a.id === actionId);
+    if (action) {
+      action.status = decision as 'approved' | 'rejected';
+      console.log(`✅ Action ${actionId} ${decision} for ${callSid}`);
+      
+      // Update status if no more pending actions
+      const pendingCount = simCall.actions.filter(a => a.status === 'pending').length;
+      if (pendingCount === 0) {
+        simCall.status = 'active';
+      }
+      
+      // Broadcast update
+      broadcastAICallUpdate(simCall);
+    }
+  }
+  
+  res.json({ success: true });
+});
+
+// Start simulation
+app.post('/api/simulate', async (req, res) => {
+  const { scenarios } = req.body;
+  
+  if (!scenarios || !Array.isArray(scenarios)) {
+    return res.status(400).json({ error: 'Missing scenarios array' });
+  }
+  
+  console.log(`\n🎬 Starting simulation with ${scenarios.length} calls...`);
+  
+  // Start each simulation with a slight delay between them
+  scenarios.forEach((scenario: any, index: number) => {
+    setTimeout(() => {
+      void runAISimulation(scenario);
+    }, index * 500); // Stagger start by 500ms
+  });
+  
+  res.json({ success: true, started: scenarios.length });
+});
+
+// Broadcast AI call update to dashboard
+function broadcastAICallUpdate(call: AISimulationCall) {
+  broadcastToDashboard({
+    type: 'ai_call_update',
+    call: {
+      id: call.callSid,
+      callSid: call.callSid,
+      scenario: call.scenario,
+      status: call.status,
+      urgency: call.urgency,
+      incident: call.incident,
+      messages: call.messages,
+      actions: call.actions,
+      startedAt: call.startedAt,
+    }
+  });
+}
+
+// Run a single AI simulation (AI dispatcher talking to AI caller)
+async function runAISimulation(scenario: {
+  name: string;
+  personality: string;
+  initialMessage: string;
+  context: string;
+}) {
+  const callSid = `SIM-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  
+  console.log(`\n📞 Starting simulation: ${scenario.name} (${callSid})`);
+  
+  // Initialize simulation call
+  const simCall: AISimulationCall = {
+    callSid,
+    scenario: scenario.name,
+    personality: scenario.personality,
+    context: scenario.context,
+    messages: [],
+    incident: {
+      location: null,
+      type: null,
+      injuries: null,
+      threatLevel: null,
+      peopleCount: null,
+      callerRole: null,
+    },
+    urgency: 'Low',
+    actions: [],
+    status: 'active',
+    startedAt: new Date(),
+  };
+  
+  aiSimulationCalls.set(callSid, simCall);
+  
+  // Broadcast call started
+  broadcastToDashboard({
+    type: 'ai_call_started',
+    callSid,
+    scenario: scenario.name,
+    timestamp: new Date().toISOString(),
+  });
+  
+  // Conversation history for context
+  const conversationHistory: { role: 'caller' | 'dispatcher'; content: string }[] = [];
+  
+  // Start with dispatcher greeting
+  const dispatcherGreeting = "911, what is your emergency?";
+  addMessageToSimCall(simCall, 'dispatcher', dispatcherGreeting);
+  conversationHistory.push({ role: 'dispatcher', content: dispatcherGreeting });
+  
+  // Then caller's initial message
+  await sleep(1500);
+  addMessageToSimCall(simCall, 'caller', scenario.initialMessage);
+  conversationHistory.push({ role: 'caller', content: scenario.initialMessage });
+  
+  // Run analysis on initial message
+  await runSimulationAnalysis(simCall);
+  
+  // Conversation loop (max 8 exchanges)
+  for (let turn = 0; turn < 8; turn++) {
+    await sleep(2000 + Math.random() * 1000);
+    
+    // Generate dispatcher response
+    const dispatcherResponse = await generateDispatcherResponse(conversationHistory, simCall);
+    if (!dispatcherResponse) break;
+    
+    addMessageToSimCall(simCall, 'dispatcher', dispatcherResponse);
+    conversationHistory.push({ role: 'dispatcher', content: dispatcherResponse });
+    
+    // Check for dispatch actions in the response
+    detectAndCreateActions(simCall, dispatcherResponse);
+    
+    await sleep(1500 + Math.random() * 1000);
+    
+    // Generate caller response
+    const callerResponse = await generateCallerResponse(conversationHistory, scenario, simCall);
+    if (!callerResponse || callerResponse.toLowerCase().includes('end call') || callerResponse.toLowerCase().includes('thank you')) {
+      // Caller ending call
+      addMessageToSimCall(simCall, 'caller', callerResponse || "Okay, thank you.");
+      break;
+    }
+    
+    addMessageToSimCall(simCall, 'caller', callerResponse);
+    conversationHistory.push({ role: 'caller', content: callerResponse });
+    
+    // Run analysis
+    await runSimulationAnalysis(simCall);
+  }
+  
+  // End simulation
+  await sleep(1000);
+  simCall.status = 'completed';
+  broadcastAICallUpdate(simCall);
+  
+  console.log(`✅ Simulation ended: ${scenario.name} (${callSid})`);
+}
+
+// Add message to simulation call and broadcast
+function addMessageToSimCall(simCall: AISimulationCall, sender: 'caller' | 'dispatcher', text: string) {
+  const message: TranscriptMessage = {
+    id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    sender,
+    text,
+    timestamp: new Date(),
+    isPartial: false,
+  };
+  
+  simCall.messages.push(message);
+  
+  // Broadcast transcript
+  broadcastToDashboard({
+    type: 'ai_transcript',
+    id: message.id,
+    call_sid: simCall.callSid,
+    sender,
+    text,
+    is_final: true,
+    is_partial: false,
+    timestamp: message.timestamp.toISOString(),
+  });
+  
+  console.log(`   ${sender === 'caller' ? '👤' : '🤖'} ${sender}: "${text.slice(0, 60)}${text.length > 60 ? '...' : ''}"`);
+}
+
+// Generate dispatcher response using OpenAI Chat API
+async function generateDispatcherResponse(
+  history: { role: 'caller' | 'dispatcher'; content: string }[],
+  simCall: AISimulationCall
+): Promise<string | null> {
+  try {
+    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${OPENAI_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        messages: [
+          {
+            role: 'system',
+            content: `You are a professional 911 dispatcher. Be calm, direct, and gather critical information efficiently.
+Ask ONE question at a time. Keep responses under 2 sentences.
+Current incident info: ${JSON.stringify(simCall.incident)}
+Missing info to gather: location, type of emergency, injuries, threat level, people count.
+
+When you have enough information to dispatch help, say something like "I'm dispatching [units] to [location]" or "Help is on the way".`
+          },
+          ...history.map(h => ({
+            role: h.role === 'dispatcher' ? 'assistant' : 'user',
+            content: h.content
+          }))
+        ],
+        max_tokens: 100,
+        temperature: 0.7,
+      }),
+    });
+    
+    const data = await response.json();
+    return data.choices?.[0]?.message?.content || null;
+  } catch (error) {
+    console.error('Error generating dispatcher response:', error);
+    return "Can you tell me exactly where you are?";
+  }
+}
+
+// Generate caller response using OpenAI Chat API
+async function generateCallerResponse(
+  history: { role: 'caller' | 'dispatcher'; content: string }[],
+  scenario: { name: string; personality: string; context: string },
+  simCall: AISimulationCall
+): Promise<string | null> {
+  try {
+    const turnCount = history.filter(h => h.role === 'caller').length;
+    
+    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${OPENAI_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        messages: [
+          {
+            role: 'system',
+            content: `You are a ${scenario.personality} 911 caller experiencing: ${scenario.context}
+Respond naturally to the dispatcher's questions. Be ${scenario.personality}.
+Gradually provide information when asked. Make up realistic details for location, injuries, etc.
+Keep responses under 2 sentences. After ${turnCount > 5 ? '1-2 more exchanges' : '4-6 exchanges'}, thank them and end the call.
+${turnCount > 6 ? 'This is the end of the call - thank them and hang up.' : ''}`
+          },
+          ...history.map(h => ({
+            role: h.role === 'caller' ? 'assistant' : 'user',
+            content: h.content
+          }))
+        ],
+        max_tokens: 80,
+        temperature: 0.8,
+      }),
+    });
+    
+    const data = await response.json();
+    return data.choices?.[0]?.message?.content || null;
+  } catch (error) {
+    console.error('Error generating caller response:', error);
+    return null;
+  }
+}
+
+// Run analysis on simulation call
+async function runSimulationAnalysis(simCall: AISimulationCall) {
+  try {
+    const response = await fetch('http://localhost:3000/api/analyze', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        messages: simCall.messages,
+        incident: simCall.incident,
+        urgency: simCall.urgency,
+        callSid: simCall.callSid,
+      }),
+    });
+    
+    if (!response.ok) return;
+    
+    const data = await response.json();
+    
+    if (data.updates) {
+      const { urgency, ...fields } = data.updates;
+      if (urgency) simCall.urgency = urgency;
+      simCall.incident = { ...simCall.incident, ...fields };
+    }
+    
+    // Broadcast analysis
+    broadcastToDashboard({
+      type: 'ai_analysis',
+      call_sid: simCall.callSid,
+      incident: simCall.incident,
+      urgency: simCall.urgency,
+    });
+    
+    broadcastAICallUpdate(simCall);
+  } catch (error) {
+    console.error('Error running simulation analysis:', error);
+  }
+}
+
+// Detect dispatch actions from dispatcher response
+function detectAndCreateActions(simCall: AISimulationCall, text: string) {
+  const lowerText = text.toLowerCase();
+  
+  // Patterns to detect dispatch actions
+  const dispatchPatterns = [
+    /dispatch(?:ing)?\s+(\d+)?\s*(police|officer|unit|car|ambulance|fire|emt|paramedic|truck)/i,
+    /send(?:ing)?\s+(\d+)?\s*(police|officer|unit|car|ambulance|fire|emt|paramedic|truck)/i,
+    /(\d+)?\s*(police|ambulance|fire)\s+(?:unit|truck|car)s?\s+(?:are|is)\s+(?:on\s+(?:the|their)\s+way|en\s+route|dispatched)/i,
+    /help\s+is\s+on\s+(?:the|its)\s+way/i,
+  ];
+  
+  for (const pattern of dispatchPatterns) {
+    const match = text.match(pattern);
+    if (match) {
+      const units = match[1] || '1';
+      const type = match[2] || 'units';
+      
+      const action: AICallAction = {
+        id: `action-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        type: 'dispatch',
+        description: `Dispatch ${units} ${type} to incident location`,
+        units: `${units} ${type}`,
+        location: simCall.incident.location || 'Location pending',
+        status: 'pending',
+        timestamp: new Date(),
+      };
+      
+      simCall.actions.push(action);
+      simCall.status = 'pending_action';
+      
+      // Broadcast action required
+      broadcastToDashboard({
+        type: 'ai_action_required',
+        call_sid: simCall.callSid,
+        action_id: action.id,
+        action_type: action.type,
+        description: action.description,
+        units: action.units,
+        location: action.location,
+      });
+      
+      console.log(`   ⚠️ ACTION REQUIRED: ${action.description}`);
+      
+      broadcastAICallUpdate(simCall);
+      break; // Only one action per response
+    }
+  }
+}
+
+// Helper sleep function
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
 
 // Twilio Voice Webhook - Returns TwiML to start media stream
 app.all('/twilio/voice', (req, res) => {
