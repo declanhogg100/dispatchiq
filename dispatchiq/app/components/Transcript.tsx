@@ -47,7 +47,7 @@ export function Transcript({ messages, title = "Live Transcript" }: TranscriptPr
                   {msg.sender === 'dispatcher' ? "Dispatcher" : "Caller"}
                 </span>
                 <span className="text-[10px] text-muted-foreground font-mono">
-                  {msg.timestamp.toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                  {new Date(msg.timestamp).toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })}
                 </span>
               </div>
               

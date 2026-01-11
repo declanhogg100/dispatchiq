@@ -1,4 +1,4 @@
-# 🚀 Supabase Setup Guide for SignalOne
+# 🚀 Supabase Setup Guide for DispatchIQ
 
 ## Quick Overview
 
@@ -10,7 +10,7 @@ This guide will help you set up Supabase to store and stream live call transcrip
 2. Click **"New Project"**
 3. Choose an organization (or create one)
 4. Fill in:
-   - **Project name**: `signalone` (or any name)
+   - **Project name**: `DispatchIQ` (or any name)
    - **Database password**: Save this somewhere safe
    - **Region**: Choose closest to you
 5. Click **"Create new project"**
@@ -69,7 +69,7 @@ SUPABASE_SERVICE_ROLE_KEY=sb_secret_17qvu6WLU2_mGJHyQMgBug_qhqYWKos
    ```
    📝 Loaded environment from .env.local
    ✅ Supabase client initialized
-   🚨 SignalOne Dispatch Server
+   🚨 DispatchIQ Dispatch Server
    ```
 
 ## Step 7: Test the Integration

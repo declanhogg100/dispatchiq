@@ -11,7 +11,7 @@ export function Header({ status }: HeaderProps) {
       <div className="flex items-center gap-6">
         <Link href="/" className="flex items-center gap-2 hover:opacity-80">
           <Radio className="h-6 w-6 text-red-500 animate-pulse" />
-          <h1 className="text-xl font-bold tracking-tight text-foreground">SignalOne</h1>
+          <h1 className="text-xl font-bold tracking-tight text-foreground">DispatchIQ</h1>
         </Link>
         
         <nav className="flex items-center gap-4 text-sm font-medium">

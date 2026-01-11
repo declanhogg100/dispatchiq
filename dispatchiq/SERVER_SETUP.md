@@ -1,4 +1,4 @@
-# SignalOne - Twilio & Deepgram Integration
+# DispatchIQ - Twilio & Deepgram Integration
 
 ## Setup Instructions
 

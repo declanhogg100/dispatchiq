@@ -15,6 +15,20 @@ import {
 } from '../types';
 
 
+// localStorage key for persisting dashboard state
+const STORAGE_KEY = 'dispatchiq_live_dashboard';
+
+interface DashboardStorageState {
+  messages: TranscriptMessage[];
+  currentCallSid: string | null;
+  incidentDetails: IncidentDetails;
+  urgency: Urgency;
+  nextQuestion: string | null;
+  showReportButton: boolean;
+  reportUrl: string | null;
+  coords: { lat: number; lon: number } | null;
+}
+
 export default function Dashboard() {
   const [status, setStatus] = useState<'connected' | 'disconnected' | 'listening'>('connected');
   const [messages, setMessages] = useState<TranscriptMessage[]>([]);
@@ -42,6 +56,73 @@ export default function Dashboard() {
   const [coords, setCoords] = useState<{ lat: number; lon: number } | null>(null);
   const [routeGeometry, setRouteGeometry] = useState<any>(null);
   const [stationCoords, setStationCoords] = useState<{ lat: number; lon: number } | null>(null);
+  const [isInitialized, setIsInitialized] = useState(false);
+
+  // Load state from localStorage on mount
+  useEffect(() => {
+    try {
+      const stored = localStorage.getItem(STORAGE_KEY);
+      if (stored) {
+        const data: DashboardStorageState = JSON.parse(stored);
+        if (data.messages) setMessages(data.messages.map(m => ({ ...m, timestamp: new Date(m.timestamp) })));
+        if (data.currentCallSid) setCurrentCallSid(data.currentCallSid);
+        if (data.incidentDetails) setIncidentDetails(data.incidentDetails);
+        if (data.urgency) setUrgency(data.urgency);
+        if (data.nextQuestion !== undefined) setNextQuestion(data.nextQuestion);
+        if (data.showReportButton) setShowReportButton(data.showReportButton);
+        if (data.reportUrl) setReportUrl(data.reportUrl);
+        if (data.coords) setCoords(data.coords);
+        console.log('📦 Restored dashboard state from localStorage');
+      }
+    } catch (e) {
+      console.error('Failed to load dashboard state:', e);
+    }
+    setIsInitialized(true);
+  }, []);
+
+  // Save state to localStorage whenever it changes
+  useEffect(() => {
+    if (!isInitialized) return; // Don't save until we've loaded
+    
+    const state: DashboardStorageState = {
+      messages,
+      currentCallSid,
+      incidentDetails,
+      urgency,
+      nextQuestion,
+      showReportButton,
+      reportUrl,
+      coords,
+    };
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  }, [messages, currentCallSid, incidentDetails, urgency, nextQuestion, showReportButton, reportUrl, coords, isInitialized]);
+
+  // Clear all call data and start fresh
+  const clearCallData = useCallback(() => {
+    setMessages([]);
+    setCurrentCallSid(null);
+    setIncidentDetails({
+      location: null,
+      type: null,
+      injuries: null,
+      threatLevel: null,
+      peopleCount: null,
+      callerRole: null,
+    });
+    setUrgency('Low');
+    setNextQuestion(null);
+    setShowReportButton(false);
+    setReportUrl(null);
+    setReport(null);
+    setCoords(null);
+    setRouteGeometry(null);
+    setStationCoords(null);
+    setEtaMinutes(null);
+    endedCallSidRef.current = null;
+    lastAnalyzedIdRef.current = null;
+    localStorage.removeItem(STORAGE_KEY);
+    console.log('🧹 Cleared all call data');
+  }, []);
 
   // Subscribe to real-time transcripts via direct WebSocket connection to backend
   useEffect(() => {
@@ -360,13 +441,21 @@ export default function Dashboard() {
                     <p className="text-sm text-muted-foreground text-center">
                         The call has concluded. Generate a comprehensive PDF report including transcript and incident details.
                     </p>
-                    <button
-                        onClick={handleGenerateReport}
-                        disabled={isGeneratingReport}
-                        className="rounded-full bg-primary px-8 py-3 text-base font-bold text-primary-foreground hover:bg-primary/90 disabled:opacity-50 shadow-lg hover:shadow-xl transition-all"
-                    >
-                        {isGeneratingReport ? 'Generating Report...' : '📄 Generate & Save PDF Report'}
-                    </button>
+                    <div className="flex gap-3">
+                        <button
+                            onClick={handleGenerateReport}
+                            disabled={isGeneratingReport}
+                            className="rounded-full bg-primary px-8 py-3 text-base font-bold text-primary-foreground hover:bg-primary/90 disabled:opacity-50 shadow-lg hover:shadow-xl transition-all"
+                        >
+                            {isGeneratingReport ? 'Generating Report...' : 'Generate PDF Report'}
+                        </button>
+                        <button
+                            onClick={clearCallData}
+                            className="rounded-full bg-secondary px-6 py-3 text-base font-medium text-secondary-foreground hover:bg-secondary/80 shadow-md transition-all"
+                        >
+                            Clear & New Call
+                        </button>
+                    </div>
                 </div>
             )}
 
@@ -375,21 +464,29 @@ export default function Dashboard() {
                 <div className="w-full rounded-xl border border-green-200 bg-green-50 p-4 flex items-center justify-between gap-4 animate-in fade-in">
                     <div className="flex items-center gap-3">
                         <div className="h-10 w-10 rounded-full bg-green-100 flex items-center justify-center text-green-600">
-                            📄
+                            ✓
                         </div>
                         <div>
                             <h4 className="font-semibold text-green-900">Report Ready</h4>
                             <p className="text-xs text-green-700">Saved to Database</p>
                         </div>
                     </div>
-                    <a 
-                        href={reportUrl} 
-                        target="_blank" 
-                        rel="noopener noreferrer"
-                        className="rounded-md bg-white border border-green-200 px-4 py-2 text-sm font-medium text-green-700 hover:bg-green-50 shadow-sm"
-                    >
-                        Download PDF
-                    </a>
+                    <div className="flex items-center gap-2">
+                        <a 
+                            href={reportUrl} 
+                            target="_blank" 
+                            rel="noopener noreferrer"
+                            className="rounded-md bg-white border border-green-200 px-4 py-2 text-sm font-medium text-green-700 hover:bg-green-50 shadow-sm"
+                        >
+                            Download PDF
+                        </a>
+                        <button
+                            onClick={clearCallData}
+                            className="rounded-md bg-white border border-gray-200 px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 shadow-sm"
+                        >
+                            New Call
+                        </button>
+                    </div>
                 </div>
             )}
 

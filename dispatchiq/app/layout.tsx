@@ -14,7 +14,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "SignalOne - AI Emergency Dispatch",
+  title: "DispatchIQ - AI Emergency Dispatch",
   description: "Real-time AI-powered 911 dispatch assistant",
 };
 

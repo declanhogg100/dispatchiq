@@ -1,4 +1,4 @@
-# 🚨 SignalOne - Quick Start Guide
+# 🚨 DispatchIQ - Quick Start Guide
 
 ## ✅ What's Been Implemented
 

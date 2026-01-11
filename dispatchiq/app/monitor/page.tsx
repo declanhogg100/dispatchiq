@@ -1,17 +1,57 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Header } from '../components/Header';
 import { AICall, AICallAction, TranscriptMessage, IncidentDetails, Urgency } from '../types';
+
+// localStorage key for persisting AI monitor state
+const STORAGE_KEY = 'dispatchiq_ai_monitor';
 
 export default function MonitorPage() {
   const [calls, setCalls] = useState<AICall[]>([]);
   const [selectedCallId, setSelectedCallId] = useState<string | null>(null);
   const [aiModeEnabled, setAiModeEnabled] = useState(false);
   const [wsConnected, setWsConnected] = useState(false);
+  const [isInitialized, setIsInitialized] = useState(false);
   
   // Derive selectedCall from calls array and selectedCallId
   const selectedCall = selectedCallId ? calls.find(c => c.callSid === selectedCallId) || null : null;
+
+  // Load state from localStorage on mount
+  useEffect(() => {
+    try {
+      const stored = localStorage.getItem(STORAGE_KEY);
+      if (stored) {
+        const data = JSON.parse(stored);
+        if (data.calls) {
+          // Restore calls with proper date objects
+          const restoredCalls = data.calls.map((call: AICall) => ({
+            ...call,
+            startedAt: new Date(call.startedAt),
+            messages: call.messages.map(m => ({ ...m, timestamp: new Date(m.timestamp) })),
+            actions: call.actions.map(a => ({ ...a, timestamp: new Date(a.timestamp) })),
+          }));
+          setCalls(restoredCalls);
+        }
+        if (data.selectedCallId) setSelectedCallId(data.selectedCallId);
+        console.log('📦 Restored AI monitor state from localStorage');
+      }
+    } catch (e) {
+      console.error('Failed to load AI monitor state:', e);
+    }
+    setIsInitialized(true);
+  }, []);
+
+  // Save state to localStorage whenever it changes
+  useEffect(() => {
+    if (!isInitialized) return;
+    
+    const state = {
+      calls,
+      selectedCallId,
+    };
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  }, [calls, selectedCallId, isInitialized]);
 
   // Connect to WebSocket for AI call updates
   useEffect(() => {
@@ -391,6 +431,12 @@ function CallDetails({ call, onApproveAction }: {
 }) {
   const pendingActions = call.actions.filter(a => a.status === 'pending');
   const approvedActions = call.actions.filter(a => a.status === 'approved');
+  const transcriptBottomRef = useRef<HTMLDivElement>(null);
+
+  // Auto-scroll transcript to bottom when new messages arrive
+  useEffect(() => {
+    transcriptBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [call.messages]);
 
   return (
     <div className="flex flex-col gap-6">
@@ -494,23 +540,26 @@ function CallDetails({ call, onApproveAction }: {
               Waiting for conversation to begin...
             </div>
           ) : (
-            call.messages.map((msg) => (
-              <div key={msg.id} className="flex flex-col gap-1">
-                <div className="flex items-center gap-2">
-                  <span className={`text-xs font-bold uppercase tracking-wider ${
-                    msg.sender === 'dispatcher' ? 'text-blue-600' : 'text-zinc-600'
-                  }`}>
-                    {msg.sender === 'dispatcher' ? 'AI Dispatcher' : 'Caller'}
-                  </span>
-                  <span className="text-[10px] text-muted-foreground font-mono">
-                    {new Date(msg.timestamp).toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })}
-                  </span>
+            <>
+              {call.messages.map((msg) => (
+                <div key={msg.id} className="flex flex-col gap-1">
+                  <div className="flex items-center gap-2">
+                    <span className={`text-xs font-bold uppercase tracking-wider ${
+                      msg.sender === 'dispatcher' ? 'text-blue-600' : 'text-zinc-600'
+                    }`}>
+                      {msg.sender === 'dispatcher' ? 'AI Dispatcher' : 'Caller'}
+                    </span>
+                    <span className="text-[10px] text-muted-foreground font-mono">
+                      {new Date(msg.timestamp).toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                    </span>
+                  </div>
+                  <p className={`text-sm leading-relaxed text-foreground ${msg.isPartial ? 'opacity-70' : ''}`}>
+                    {msg.text}
+                  </p>
                 </div>
-                <p className={`text-sm leading-relaxed text-foreground ${msg.isPartial ? 'opacity-70' : ''}`}>
-                  {msg.text}
-                </p>
-              </div>
-            ))
+              ))}
+              <div ref={transcriptBottomRef} />
+            </>
           )}
         </div>
       </div>

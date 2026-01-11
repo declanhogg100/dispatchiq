@@ -1,4 +1,4 @@
-# SignalOne - Live Transcript Flow Debug Guide
+# DispatchIQ - Live Transcript Flow Debug Guide
 
 ## How Data Flows (End-to-End)
 

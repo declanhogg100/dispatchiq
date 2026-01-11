@@ -1,4 +1,4 @@
--- SignalOne Database Schema for Supabase
+-- DispatchIQ Database Schema for Supabase
 
 -- Enable realtime for the public schema
 -- Run this in Supabase SQL Editor

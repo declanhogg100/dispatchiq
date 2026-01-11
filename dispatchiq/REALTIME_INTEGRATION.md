@@ -71,7 +71,7 @@ npm run dev
 ```
 📝 Loaded environment from .env.local
 ✅ Supabase client initialized
-🚨 SignalOne Dispatch Server
+🚨 DispatchIQ Dispatch Server
 📞 Incoming POST request to /twilio/voice
 🔌 Twilio WebSocket connected
 🚨 Call started: CAxxxxx

@@ -29,6 +29,7 @@ const PUBLIC_HOST = process.env.PUBLIC_HOST;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const DISPATCHER_PHONE = process.env.DISPATCHER_PHONE;
 
 // OpenAI Realtime API config
 // Try these model names if one doesn't work:
@@ -445,7 +446,7 @@ async function storeTranscript(
     }
   } else {
     // Broadcast to human dispatcher dashboard
-    broadcastToDashboard(transcriptData);
+  broadcastToDashboard(transcriptData);
   }
   
   const broadcastElapsed = Date.now() - broadcastStartTime;
@@ -831,7 +832,7 @@ async function runSimulationAnalysis(simCall: AISimulationCall) {
     });
     
     broadcastAICallUpdate(simCall);
-  } catch (error) {
+    } catch (error) {
     console.error('Error running simulation analysis:', error);
   }
 }
@@ -891,27 +892,51 @@ function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// Twilio Voice Webhook - Returns TwiML to start media stream
+// Twilio Voice Webhook - Returns TwiML based on AI mode
 app.all('/twilio/voice', (req, res) => {
   console.log(`📞 Incoming ${req.method} request to /twilio/voice`);
+  console.log(`   AI Mode: ${aiModeEnabled ? 'ON' : 'OFF'}`);
   
-  const websocketUrl = PUBLIC_HOST 
-    ? `wss://${PUBLIC_HOST}/twilio/media`
-    : `wss://YOUR_NGROK_URL_HERE/twilio/media`;
-
-  // AI Agent mode - bidirectional audio via <Connect><Stream>
-  console.log('🤖 AI mode: Caller will interact with OpenAI Realtime API (bidirectional stream)');
-  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+  let twiml: string;
+  
+  if (aiModeEnabled) {
+    // AI Agent mode - bidirectional audio via <Connect><Stream>
+    const websocketUrl = PUBLIC_HOST 
+      ? `wss://${PUBLIC_HOST}/twilio/media`
+      : `wss://YOUR_NGROK_URL_HERE/twilio/media`;
+    
+    console.log('🤖 AI mode: Caller will interact with OpenAI Realtime API');
+    twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
     <Stream url="${websocketUrl}" />
   </Connect>
 </Response>`;
+    console.log('✅ TwiML response sent with WebSocket URL:', websocketUrl);
+  } else {
+    // Human dispatcher mode - dial the dispatcher phone
+    if (!DISPATCHER_PHONE) {
+      console.error('❌ DISPATCHER_PHONE not set in environment!');
+      twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say>Sorry, no dispatcher is available at this time. Please try again later.</Say>
+  <Hangup/>
+</Response>`;
+    } else {
+      console.log(`📞 Human mode: Connecting caller to dispatcher at ${DISPATCHER_PHONE}`);
+      twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say>Please hold while we connect you to a dispatcher.</Say>
+  <Dial record="record-from-answer-dual" recordingStatusCallback="/twilio/recording">
+    <Number>${DISPATCHER_PHONE}</Number>
+  </Dial>
+</Response>`;
+      console.log('✅ TwiML response sent - dialing dispatcher');
+    }
+  }
 
   res.set('Content-Type', 'text/xml');
   res.send(twiml);
-  
-  console.log('✅ TwiML response sent with WebSocket URL:', websocketUrl);
 });
 
 // Optional: Receive precise device geolocation from a mobile app and broadcast to dashboard
@@ -1074,7 +1099,7 @@ function handleOpenAIEvent(callSid: string, streamSid: string, twilioWs: WSType,
         
         if (twilioWs.readyState === WebSocket.OPEN) {
           twilioWs.send(JSON.stringify(audioMessage));
-        } else {
+    } else {
           console.warn(`⚠️  Twilio WebSocket not open (state: ${twilioWs.readyState})`);
         }
       }
@@ -1314,7 +1339,7 @@ wss.on('connection', (ws: WSType, req) => {
               });
             }
             console.log(`🖥️  AI call ended: ${msg.stop.callSid}`);
-          } else {
+    } else {
             // Broadcast to human dispatcher dashboard
             broadcastToDashboard({
               type: 'call_ended',
@@ -1431,16 +1456,16 @@ async function analyzeAndBroadcast(callSid: string, state: CallState) {
           incident: state.incident,
           urgency: state.urgency,
         });
-      }
-    } else {
+        }
+      } else {
       // Broadcast analysis results to human dispatcher dashboard
-      broadcastToDashboard({
-        type: 'analysis',
-        call_sid: callSid,
-        incident: state.incident,
-        urgency: state.urgency,
-        nextQuestion: state.nextQuestion,
-      });
+    broadcastToDashboard({
+      type: 'analysis',
+      call_sid: callSid,
+      incident: state.incident,
+      urgency: state.urgency,
+      nextQuestion: state.nextQuestion,
+    });
     }
 
     // If we have a textual location, try geocoding server-side and push precise coords
@@ -1520,7 +1545,7 @@ async function generateReport(callSid: string, state: CallState) {
 
 // Start server
 httpServer.listen(Number(PORT), '0.0.0.0', () => {
-  console.log('\n🚨 SignalOne Server (OpenAI Realtime API)');
+  console.log('\n🚨 DispatchIQ Server (OpenAI Realtime API)');
   console.log('==========================================');
   console.log(`✅ HTTP Server: http://localhost:${PORT}`);
   console.log(`✅ WebSocket (Twilio): ws://localhost:${PORT}/twilio/media`);
