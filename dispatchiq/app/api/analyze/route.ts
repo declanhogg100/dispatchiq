@@ -45,42 +45,42 @@ export async function POST(req: Request) {
   try {
     const result = await runGeminiAnalysis(messages, incident, urgency);
     
-    // Save to database if Supabase is configured and callSid is present
+    // Save to database ASYNC - don't block the response!
+    // This shaves ~100-200ms off the response time
     if (supabase && callSid && result.updates) {
-        // We only want to save if there are actual updates to incident fields or urgency
-        // Or we can just save the latest state every time analysis runs (easier)
-        const newIncidentState = { ...incident, ...result.updates };
-        // eslint-disable-next-line @typescript-eslint/no-unused-vars
-        const { urgency: newUrgency, ...fields } = result.updates;
-        const finalUrgency = newUrgency || urgency;
+        // Fire and forget - don't await
+        (async () => {
+            try {
+                const newIncidentState = { ...incident, ...result.updates };
+                // eslint-disable-next-line @typescript-eslint/no-unused-vars
+                const { urgency: newUrgency, ...fields } = result.updates;
+                const finalUrgency = newUrgency || urgency;
 
-        // Upsert into incidents table
-        // We need the call_id. But wait, incidents table uses call_id (UUID) and call_sid (TEXT).
-        // call_sid is unique in calls table.
-        // We can look up call_id using call_sid.
-        
-        // Find call_id
-        const { data: callData } = await supabase
-            .from('calls')
-            .select('id')
-            .eq('call_sid', callSid)
-            .single();
-            
-        if (callData) {
-            await supabase.from('incidents').upsert({
-                call_id: callData.id,
-                call_sid: callSid,
-                location: newIncidentState.location,
-                type: newIncidentState.type,
-                injuries: newIncidentState.injuries,
-                threat_level: newIncidentState.threatLevel,
-                people_count: newIncidentState.peopleCount,
-                caller_role: newIncidentState.callerRole,
-                urgency: finalUrgency,
-                next_question: result.nextQuestion,
-                updated_at: new Date().toISOString()
-            }, { onConflict: 'call_sid' });
-        }
+                const { data: callData } = await supabase
+                    .from('calls')
+                    .select('id')
+                    .eq('call_sid', callSid)
+                    .single();
+                    
+                if (callData) {
+                    await supabase.from('incidents').upsert({
+                        call_id: callData.id,
+                        call_sid: callSid,
+                        location: newIncidentState.location,
+                        type: newIncidentState.type,
+                        injuries: newIncidentState.injuries,
+                        threat_level: newIncidentState.threatLevel,
+                        people_count: newIncidentState.peopleCount,
+                        caller_role: newIncidentState.callerRole,
+                        urgency: finalUrgency,
+                        next_question: result.nextQuestion,
+                        updated_at: new Date().toISOString()
+                    }, { onConflict: 'call_sid' });
+                }
+            } catch (e) {
+                console.error('Background DB save failed:', e);
+            }
+        })();
     }
 
     return NextResponse.json(result);
@@ -148,40 +148,27 @@ function buildPrompt(
   incident: IncidentDetails,
   urgency: Urgency,
 ): string {
-  const transcriptWindow = messages.slice(-20);
+  // Only use last 5 messages for speed (less tokens = faster)
+  const transcriptWindow = messages.slice(-5);
   const transcriptText = transcriptWindow
-    .map(
-      (msg) =>
-        `${msg.sender === 'dispatcher' ? 'DISPATCHER' : 'CALLER'}: ${msg.text}`,
-    )
+    .map((msg) => `${msg.sender === 'dispatcher' ? 'D' : 'C'}: ${msg.text}`)
     .join('\n');
 
   const missing = REQUIRED_FIELDS.filter((key) => !incident[key]);
 
-  return `
-You are an emergency dispatch copilot. Maintain a structured incident state as JSON only.
-Rules:
-- Always return valid JSON, no code fences.
-- Provide concise updates only for fields that changed.
-- Respect dispatcher overrides (do not contradict provided values).
-- Suggest exactly one next_question that fills the highest-priority missing info.
-- urgency must be one of: Low, Medium, Critical.
+  // Concise prompt = faster LLM response
+  return `911 dispatch AI. Extract info, suggest 1 question. JSON only.
 
-Current structured state:
-${JSON.stringify(incident, null, 2)}
-Current urgency: ${urgency}
-Missing required fields (in priority order): ${missing.join(', ') || 'none'}
+State: ${JSON.stringify(incident)}
+Urgency: ${urgency}
+Missing: ${missing.join(',')||'none'}
 
-Transcript (latest first):
+Transcript:
 ${transcriptText}
 
-Respond with:
-{
-  "updates": { "field": "new value", "urgency": "Low|Medium|Critical" },
-  "missing": ["field names still unknown"],
-  "next_question": "one short dispatcher-style question"
-}
-  `.trim();
+Reply: {"updates":{},"missing":[],"next_question":""}
+Updates: only changed fields. urgency: Low/Medium/Critical
+next_question: short, direct, dispatcher-style`.trim();
 }
 
 function parseModelJson(

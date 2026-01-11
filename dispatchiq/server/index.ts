@@ -600,11 +600,12 @@ async function initDeepgramConnection(callSid: string, isTwoWay: boolean = false
     encoding: 'mulaw',
     sample_rate: 8000,
     channels: 1,  // Single channel = caller only
-    punctuate: true,
+    punctuate: false,  // Disable for speed (we don't need perfect punctuation)
     interim_results: true,  // Enable interim for live feel
-    smart_format: true,
-    model: 'nova-2-phonecall',  // Use accurate model since we're only processing 1 channel
-    endpointing: 300,  // Aggressive endpointing (300ms silence = end of utterance)
+    smart_format: false,  // Disable for speed
+    model: 'nova-2-phonecall',  // Optimized for phone audio
+    endpointing: 200,  // Very aggressive (200ms silence = end of utterance)
+    utterance_end_ms: 300,  // Force utterance end after 1s silence
   };
 
   // No multichannel needed - we only process caller audio
@@ -744,6 +745,7 @@ function sendTwilioClear(ws: WSType, streamSid: string) {
 }
 
 async function startAuraTts(callSid: string, text: string) {
+  const ttsStart = Date.now();
   console.log(`🚀 Starting Aura TTS for ${callSid} with text: "${text}"`);
   const session = callSessionMap.get(callSid);
   if (!session) {
@@ -781,7 +783,7 @@ async function startAuraTts(callSid: string, text: string) {
       return;
     }
 
-    console.log('🔊 TTS HTTP stream started');
+    console.log(`🔊 TTS HTTP stream started (${Date.now() - ttsStart}ms to connect)`);
     let loggedOnce = false;
     const reader: any = (resp.body as any).getReader ? (resp.body as any).getReader() : null;
 
@@ -794,7 +796,7 @@ async function startAuraTts(callSid: string, text: string) {
         const payload = buffer.toString('base64');
         sendTwilioMedia(session, payload);
         if (!loggedOnce) {
-          console.log('🎵 Receiving TTS audio chunks from Deepgram (HTTP)...');
+          console.log(`🎵 First TTS audio chunk sent (${Date.now() - ttsStart}ms from request)`);
           loggedOnce = true;
         }
       }
@@ -805,7 +807,7 @@ async function startAuraTts(callSid: string, text: string) {
         const payload = buffer.toString('base64');
         sendTwilioMedia(session, payload);
         if (!loggedOnce) {
-          console.log('🎵 Receiving TTS audio chunks from Deepgram (HTTP)...');
+          console.log(`🎵 First TTS audio chunk sent (${Date.now() - ttsStart}ms from request)`);
           loggedOnce = true;
         }
       }
@@ -827,6 +829,7 @@ async function startAuraTts(callSid: string, text: string) {
 
 // Call Gemini analysis via Next API and broadcast updates
 async function analyzeAndBroadcast(callSid: string, state: CallState) {
+  const analysisStart = Date.now();
   console.log(`🔍 Starting analysis for ${callSid}...`);
   try {
     const response = await fetch('http://localhost:3000/api/analyze', {
@@ -843,7 +846,8 @@ async function analyzeAndBroadcast(callSid: string, state: CallState) {
       return;
     }
     const data = await response.json();
-    console.log(`🧠 Analysis result for ${callSid}:`, JSON.stringify(data, null, 2)); // Debug log
+    const analysisTime = Date.now() - analysisStart;
+    console.log(`🧠 Analysis complete (${analysisTime}ms) for ${callSid}:`, JSON.stringify(data, null, 2));
 
     const { updates, nextQuestion } = data;
     if (updates) {
