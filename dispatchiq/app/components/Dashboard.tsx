@@ -13,28 +13,11 @@ import {
   ReportResponsePayload,
 } from '../types';
 
-// Mock scenario: Reporting a fire
-const MOCK_SCENARIO = [
-  { delay: 1000, sender: 'dispatcher', text: "911, what is your emergency?" },
-  { delay: 3500, sender: 'caller', text: "Hi, I think... I think my neighbor's house is on fire! I see smoke coming from the windows." },
-  { delay: 1000, update: { type: 'Fire', threatLevel: 'Medium' } },
-  { delay: 500, nextQuestion: "What is the address of the emergency?" },
-  { delay: 4000, sender: 'dispatcher', text: "Okay, stay calm. What is the address?" },
-  { delay: 3000, sender: 'caller', text: "It's 124 Maple Street. The one on the corner." },
-  { delay: 1000, update: { location: '124 Maple Street' } },
-  { delay: 500, nextQuestion: "Are there any people inside the house?" },
-  { delay: 4000, sender: 'dispatcher', text: "124 Maple Street. Do you know if anyone is inside?" },
-  { delay: 3500, sender: 'caller', text: "I don't know for sure, but I saw a car in the driveway. The Johnsons live there, they have two kids." },
-  { delay: 1000, update: { peopleCount: 'Possible family of 4', urgency: 'Critical' } },
-  { delay: 500, nextQuestion: "Do you see any flames, or just smoke?" },
-  { delay: 4000, sender: 'dispatcher', text: "Okay, help is on the way. Do you see flames or just smoke?" },
-  { delay: 3000, sender: 'caller', text: "Just black smoke right now, but it's getting really thick." },
-  { delay: 500, nextQuestion: "Are you in a safe location?" },
-];
 
 export default function Dashboard() {
   const [status, setStatus] = useState<'connected' | 'disconnected' | 'listening'>('connected');
   const [messages, setMessages] = useState<TranscriptMessage[]>([]);
+  const [currentCallSid, setCurrentCallSid] = useState<string | null>(null);
   const [incidentDetails, setIncidentDetails] = useState<IncidentDetails>({
     location: null,
     type: null,
@@ -45,65 +28,99 @@ export default function Dashboard() {
   });
   const [urgency, setUrgency] = useState<Urgency>('Low');
   const [nextQuestion, setNextQuestion] = useState<string | null>(null);
-  const [isSimulationRunning, setIsSimulationRunning] = useState(false);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const lastAnalyzedIdRef = useRef<string | null>(null);
+  const endedCallSidRef = useRef<string | null>(null);
   const debounceTimerRef = useRef<NodeJS.Timeout | null>(null);
   const DEBOUNCE_MS = 350;
   const [report, setReport] = useState<string | null>(null);
+  const [reportUrl, setReportUrl] = useState<string | null>(null);
+  const [showReportButton, setShowReportButton] = useState(false);
   const [isGeneratingReport, setIsGeneratingReport] = useState(false);
 
   // Subscribe to real-time transcripts via direct WebSocket connection to backend
   useEffect(() => {
-    const wsUrl = 'ws://localhost:3001/dashboard';
+    const wsUrl = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:3001/dashboard';
     console.log('🔌 Connecting to backend WebSocket:', wsUrl);
     
-    const ws = new WebSocket(wsUrl);
+    let ws: WebSocket | null = null;
+    let reconnectTimer: NodeJS.Timeout;
 
-    ws.onopen = () => {
-      console.log('✅ Connected to backend WebSocket');
-      setStatus('connected');
+    const connect = () => {
+        ws = new WebSocket(wsUrl);
+
+        ws.onopen = () => {
+            console.log('✅ Connected to backend WebSocket');
+            setStatus('connected');
+        };
+
+        ws.onmessage = (event) => {
+            try {
+                const data = JSON.parse(event.data);
+
+                if (data.type === 'transcript') {
+                    const message: TranscriptMessage = {
+                        id: data.id,
+                        sender: data.sender as 'caller' | 'dispatcher',
+                        text: data.text,
+                        timestamp: new Date(data.timestamp),
+                        isPartial: data.is_partial
+                    };
+
+                    setMessages((prev) => {
+                        // Avoid duplicates
+                        if (prev.some(m => m.id === message.id)) return prev;
+                        return [...prev, message];
+                    });
+                    
+                    // If this transcript belongs to the call that just ended, don't switch back to listening
+                    if (data.call_sid === endedCallSidRef.current) {
+                        // Do nothing to status
+                    } else {
+                        // New call or ongoing call
+                        if (currentCallSid !== data.call_sid) {
+                            setCurrentCallSid(data.call_sid);
+                        }
+                        endedCallSidRef.current = null; // Reset
+                        setStatus('listening');
+                        setShowReportButton(false);
+                        setReportUrl(null);
+                        setReport(null);
+                    }
+                } else if (data.type === 'call_ended') {
+                    console.log('🏁 Call ended, switching to standby');
+                    endedCallSidRef.current = data.call_sid;
+                    setStatus('connected');
+                    setShowReportButton(true);
+                }
+            } catch (error) {
+                console.error('❌ Error parsing WebSocket message:', error);
+            }
+        };
+
+        ws.onerror = (error) => {
+            console.error('❌ WebSocket error:', error);
+            setStatus('disconnected');
+        };
+
+        ws.onclose = () => {
+            console.log('🔌 Disconnected from backend WebSocket');
+            setStatus('disconnected');
+            
+            // Try to reconnect after 3 seconds
+            reconnectTimer = setTimeout(() => {
+                console.log('🔄 Attempting to reconnect...');
+                connect();
+            }, 3000);
+        };
     };
 
-    ws.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data);
-
-        if (data.type === 'transcript') {
-          const message: TranscriptMessage = {
-            id: data.id,
-            sender: data.sender as 'caller' | 'dispatcher',
-            text: data.text,
-            timestamp: new Date(data.timestamp),
-            isPartial: data.is_partial
-          };
-
-          setMessages((prev) => {
-            // Avoid duplicates
-            if (prev.some(m => m.id === message.id)) return prev;
-            return [...prev, message];
-          });
-          
-          setStatus('listening');
-        }
-      } catch (error) {
-        console.error('❌ Error parsing WebSocket message:', error);
-      }
-    };
-
-    ws.onerror = (error) => {
-      console.error('❌ WebSocket error:', error);
-      setStatus('disconnected');
-    };
-
-    ws.onclose = () => {
-      console.log('🔌 Disconnected from backend WebSocket');
-      setStatus('disconnected');
-    };
+    connect();
 
     return () => {
       console.log('🔌 Cleaning up WebSocket connection...');
-      ws.close();
+      if (ws) ws.close();
+      if (reconnectTimer) clearTimeout(reconnectTimer);
     };
   }, []);
 
@@ -123,6 +140,7 @@ export default function Dashboard() {
           messages,
           incident: incidentDetails,
           urgency,
+          callSid: currentCallSid,
         }),
       });
 
@@ -149,57 +167,9 @@ export default function Dashboard() {
     } finally {
       setIsAnalyzing(false);
     }
-  }, [incidentDetails, messages, urgency]);
+  }, [incidentDetails, messages, urgency, currentCallSid]);
 
-  const runSimulation = async () => {
-    if (isSimulationRunning) return;
-    setIsSimulationRunning(true);
-    setStatus('listening');
-    setMessages([]);
-    setIncidentDetails({
-        location: null,
-        type: null,
-        injuries: null,
-        threatLevel: null,
-        peopleCount: null,
-        callerRole: null,
-    });
-    setUrgency('Low');
-    setNextQuestion(null);
-    setReport(null);
-    lastAnalyzedIdRef.current = null;
-
-    for (const step of MOCK_SCENARIO) {
-      await new Promise(r => setTimeout(r, step.delay));
-      
-      // Handle messages
-      if ('text' in step) {
-        setMessages(prev => [...prev, {
-          id: Date.now().toString(),
-          sender: step.sender as 'dispatcher' | 'caller',
-          text: step.text!,
-          timestamp: new Date(),
-          isPartial: false
-        }]);
-      }
-
-      // Handle updates
-      if ('update' in step) {
-        const update = step.update as any;
-        if (update.urgency) setUrgency(update.urgency);
-        setIncidentDetails(prev => ({ ...prev, ...update }));
-      }
-
-      // Handle next question
-      if ('nextQuestion' in step) {
-        setNextQuestion(step.nextQuestion!);
-      }
-    }
-    
-    setIsSimulationRunning(false);
-    setStatus('connected');
-
-    // Generate report after simulation completes
+  const handleGenerateReport = async () => {
     setIsGeneratingReport(true);
     try {
       const response = await fetch('/api/report', {
@@ -209,12 +179,15 @@ export default function Dashboard() {
           messages,
           incident: incidentDetails,
           urgency,
-          callId: `sim-${Date.now()}`,
+          callId: `call-${Date.now()}`,
         }),
       });
       if (response.ok) {
         const data = (await response.json()) as ReportResponsePayload;
         setReport(data.report);
+        if (data.publicUrl) {
+            setReportUrl(data.publicUrl);
+        }
       } else {
         setReport('Report generation failed.');
       }
@@ -223,8 +196,10 @@ export default function Dashboard() {
       setReport('Report generation failed.');
     } finally {
       setIsGeneratingReport(false);
+      setShowReportButton(false);
     }
   };
+
 
   useEffect(() => {
     if (debounceTimerRef.current) {
@@ -261,34 +236,55 @@ export default function Dashboard() {
 
             {/* Middle: Incident State */}
             <div className="rounded-xl border border-border bg-card p-6 shadow-sm">
-                <IncidentState details={incidentDetails} urgency={urgency} />
+                <IncidentState 
+                  details={incidentDetails} 
+                  urgency={urgency}
+                  isEditable={showReportButton}
+                  onDetailsUpdate={(updates) => setIncidentDetails(prev => ({ ...prev, ...updates }))}
+                  onUrgencyUpdate={(newUrgency) => setUrgency(newUrgency)}
+                />
             </div>
 
-            {/* Bottom: Debug/Controls (for demo purposes) */}
-            <div className="mt-auto rounded-xl border border-dashed border-border p-4 bg-muted/30">
-                <div className="flex items-center justify-between">
-                    <p className="text-sm text-muted-foreground">
-                        Demo Controls: Simulate a live emergency call flow.
+            {/* Report Generation Button (pops up when call ends) */}
+            {showReportButton && (
+                <div className="w-full rounded-xl border-2 border-primary bg-primary/10 p-6 flex flex-col items-center justify-center gap-3 animate-in fade-in slide-in-from-top-4">
+                    <h3 className="text-lg font-semibold text-primary">Call Ended</h3>
+                    <p className="text-sm text-muted-foreground text-center">
+                        The call has concluded. Generate a comprehensive PDF report including transcript and incident details.
                     </p>
-                    <button 
-                        onClick={runSimulation}
-                        disabled={isSimulationRunning}
-                        className="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+                    <button
+                        onClick={handleGenerateReport}
+                        disabled={isGeneratingReport}
+                        className="rounded-full bg-primary px-8 py-3 text-base font-bold text-primary-foreground hover:bg-primary/90 disabled:opacity-50 shadow-lg hover:shadow-xl transition-all"
                     >
-                        {isSimulationRunning ? 'Simulation Running...' : 'Start Simulation'}
+                        {isGeneratingReport ? 'Generating Report...' : '📄 Generate & Save PDF Report'}
                     </button>
                 </div>
-                <div className="mt-4">
-                  <p className="text-xs font-semibold text-muted-foreground mb-1">
-                    Latest Report (debug)
-                  </p>
-                  <div className="rounded-lg border bg-white p-3 text-xs text-slate-700 max-h-48 overflow-auto">
-                    {isGeneratingReport && <span>Generating report...</span>}
-                    {!isGeneratingReport && report && <pre className="whitespace-pre-wrap">{report}</pre>}
-                    {!isGeneratingReport && !report && <span>No report yet.</span>}
-                  </div>
+            )}
+
+            {/* Success State: Download Link */}
+            {reportUrl && (
+                <div className="w-full rounded-xl border border-green-200 bg-green-50 p-4 flex items-center justify-between gap-4 animate-in fade-in">
+                    <div className="flex items-center gap-3">
+                        <div className="h-10 w-10 rounded-full bg-green-100 flex items-center justify-center text-green-600">
+                            📄
+                        </div>
+                        <div>
+                            <h4 className="font-semibold text-green-900">Report Ready</h4>
+                            <p className="text-xs text-green-700">Saved to Database</p>
+                        </div>
+                    </div>
+                    <a 
+                        href={reportUrl} 
+                        target="_blank" 
+                        rel="noopener noreferrer"
+                        className="rounded-md bg-white border border-green-200 px-4 py-2 text-sm font-medium text-green-700 hover:bg-green-50 shadow-sm"
+                    >
+                        Download PDF
+                    </a>
                 </div>
-            </div>
+            )}
+
         </section>
       </main>
     </div>

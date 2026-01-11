@@ -22,6 +22,7 @@ export interface AnalysisRequestPayload {
   messages: TranscriptMessage[];
   incident: IncidentDetails;
   urgency: Urgency;
+  callSid?: string;
 }
 
 // Structured response returned by the LLM-backed analysis endpoint.

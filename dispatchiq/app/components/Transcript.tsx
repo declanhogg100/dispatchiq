@@ -9,9 +9,10 @@ function cn(...classes: (string | undefined | null | false)[]) {
 
 interface TranscriptProps {
   messages: TranscriptMessage[];
+  title?: string;
 }
 
-export function Transcript({ messages }: TranscriptProps) {
+export function Transcript({ messages, title = "Live Transcript" }: TranscriptProps) {
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -23,7 +24,7 @@ export function Transcript({ messages }: TranscriptProps) {
       <div className="border-b border-border bg-muted/50 p-4">
         <h2 className="font-semibold flex items-center gap-2">
           <Phone className="h-4 w-4" />
-          Live Transcript
+          {title}
         </h2>
       </div>
       
@@ -36,31 +37,26 @@ export function Transcript({ messages }: TranscriptProps) {
           messages.map((msg) => (
             <div
               key={msg.id}
-              className={cn(
-                "flex gap-3",
-                msg.sender === 'dispatcher' ? "flex-row-reverse" : "flex-row"
-              )}
+              className="flex flex-col gap-1"
             >
-              <div className={cn(
-                "flex h-8 w-8 shrink-0 items-center justify-center rounded-full border",
-                msg.sender === 'dispatcher' ? "bg-blue-100 text-blue-700 border-blue-200" : "bg-zinc-100 text-zinc-700 border-zinc-200"
-              )}>
-                {msg.sender === 'dispatcher' ? "D" : "C"}
-              </div>
-              
-              <div className={cn(
-                "flex flex-col max-w-[80%] rounded-lg p-3 text-sm",
-                msg.sender === 'dispatcher' 
-                  ? "bg-blue-50 text-blue-900 rounded-tr-none" 
-                  : "bg-zinc-50 text-zinc-900 rounded-tl-none"
-              )}>
-                <p className={cn(msg.isPartial && "opacity-70 animate-pulse")}>
-                  {msg.text}
-                </p>
-                <span className="mt-1 text-[10px] opacity-50">
-                  {msg.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+              <div className="flex items-center gap-2">
+                <span className={cn(
+                  "text-xs font-bold uppercase tracking-wider",
+                  msg.sender === 'dispatcher' ? "text-blue-600" : "text-zinc-600" // Distinct colors for names
+                )}>
+                  {msg.sender === 'dispatcher' ? "Dispatcher" : "Caller"}
+                </span>
+                <span className="text-[10px] text-muted-foreground font-mono">
+                  {msg.timestamp.toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })}
                 </span>
               </div>
+              
+              <p className={cn(
+                "text-sm leading-relaxed text-foreground",
+                msg.isPartial && "opacity-70"
+              )}>
+                {msg.text}
+              </p>
             </div>
           ))
         )}
