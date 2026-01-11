@@ -207,7 +207,7 @@ interface CallState {
 const callStateMap = new Map<string, CallState>();
 const callSessionMap = new Map<
   string,
-  { ws: WSType; streamSid: string; tts?: WebSocket; speaking?: boolean }
+  { ws: WSType; streamSid: string; tts?: WebSocket; speaking?: boolean; outSeq?: number }
 >();
 
 // Helper: Create call record in Supabase
@@ -637,12 +637,18 @@ async function initDeepgramConnection(callSid: string, isTwoWay: boolean = false
 // --- LLM + TTS helpers ---
 
 function sendTwilioMedia(session: { ws: WSType; streamSid: string }, payloadBase64: string) {
+  // Twilio expects media messages with an incrementing chunk and timestamp
+  const chunk = ((session as any).outSeq ?? 0) + 1;
+  (session as any).outSeq = chunk;
+  const timestamp = Date.now().toString();
   const message = {
     event: 'media',
     streamSid: session.streamSid,
     media: {
       payload: payloadBase64,
       track: 'outbound_track',
+      chunk: chunk.toString(),
+      timestamp,
     },
   };
   try {
