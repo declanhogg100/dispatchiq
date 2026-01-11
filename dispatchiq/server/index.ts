@@ -1553,7 +1553,7 @@ async function analyzeAndBroadcast(callSid: string, state: CallState) {
     const analysisTime = Date.now() - analysisStart;
     console.log(`🧠 Analysis complete (${analysisTime}ms) for ${callSid}`);
 
-    const { updates, nextQuestion } = data;
+    const { updates, nextQuestion, missing } = data;
     if (updates) {
       const { urgency, ...fields } = updates;
       if (urgency) state.urgency = urgency as Urgency;
@@ -1586,6 +1586,7 @@ async function analyzeAndBroadcast(callSid: string, state: CallState) {
       incident: state.incident,
       urgency: state.urgency,
       nextQuestion: state.nextQuestion,
+      missing,
     });
     }
 

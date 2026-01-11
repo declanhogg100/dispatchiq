@@ -94,7 +94,6 @@ export function IncidentState({ details, urgency, isEditable = false, onDetailsU
               label="Location" 
               value={details.location} 
               icon={MapPin} 
-              critical={true} 
               isEditable={isEditable}
               onChange={(val) => onDetailsUpdate?.({ location: val })}
             />
@@ -104,7 +103,6 @@ export function IncidentState({ details, urgency, isEditable = false, onDetailsU
           label="Type" 
           value={details.type} 
           icon={AlertTriangle} 
-          critical={true}
           isEditable={isEditable}
           onChange={(val) => onDetailsUpdate?.({ type: val })}
         />
