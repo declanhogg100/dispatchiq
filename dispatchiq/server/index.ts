@@ -105,6 +105,7 @@ dashboardWss.on('connection', (ws: WSType) => {
 
 // Helper: Broadcast transcript to all dashboard clients
 function broadcastToDashboard(data: any) {
+  const startTime = Date.now();
   const message = JSON.stringify(data);
   let successCount = 0;
   let failCount = 0;
@@ -123,7 +124,8 @@ function broadcastToDashboard(data: any) {
     }
   });
   
-  console.log(`📡 Broadcast result: ${successCount} sent, ${failCount} failed, ${dashboardClients.size} total clients`);
+  const elapsed = Date.now() - startTime;
+  console.log(`📡 Broadcast: ${successCount} sent, ${failCount} failed (${elapsed}ms)`);
 }
 
 // Middleware
@@ -220,6 +222,8 @@ async function storeTranscript(
   isFinal: boolean,
   confidence?: number
 ) {
+  const broadcastStartTime = Date.now();
+  
   // Always broadcast to dashboard clients immediately
   const transcriptData = {
     type: 'transcript',
@@ -233,19 +237,18 @@ async function storeTranscript(
     timestamp: new Date().toISOString()
   };
   
-  console.log(`📡 Broadcasting transcript to ${dashboardClients.size} dashboard client(s)`);
   broadcastToDashboard(transcriptData);
+  const broadcastElapsed = Date.now() - broadcastStartTime;
 
   // Also store in Supabase if configured
   if (!supabase) {
-    console.warn('⚠️  Supabase not available - transcript not stored in DB');
+    console.log(`   ⏱️  Broadcast only: ${broadcastElapsed}ms (no DB)`);
     return;
   }
 
   try {
+    const dbStartTime = Date.now();
     const callId = callIdMap.get(callSid);
-    
-    console.log(`💾 Storing transcript for ${callSid} (call_id: ${callId}): "${text.substring(0, 30)}..."`);
     
     const { error } = await supabase
       .from('transcripts')
@@ -264,7 +267,8 @@ async function storeTranscript(
       throw error;
     }
     
-    console.log(`✅ Transcript stored successfully in DB`);
+    const dbElapsed = Date.now() - dbStartTime;
+    console.log(`   ⏱️  Broadcast: ${broadcastElapsed}ms, DB: ${dbElapsed}ms`);
   } catch (error) {
     console.error('❌ Error storing transcript:', error);
   }
@@ -306,24 +310,39 @@ app.all('/twilio/voice', (req, res) => {
     ? `wss://${PUBLIC_HOST}/twilio/media`
     : `wss://YOUR_NGROK_URL_HERE/twilio/media`;
 
-  // Your dispatcher phone number (the number that will receive the call)
-  const DISPATCHER_PHONE = process.env.DISPATCHER_PHONE || '+1234567890'; // Change this!
+  // Your dispatcher phone number (optional)
+  const DISPATCHER_PHONE = process.env.DISPATCHER_PHONE;
 
-  // TwiML that streams audio AND connects the call to dispatcher
-  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+  let twiml;
+
+  if (DISPATCHER_PHONE) {
+    // TWO-WAY MODE: Connect caller to dispatcher (for demo with friend)
+    console.log('📱 Two-way mode: Call will ring dispatcher at', DISPATCHER_PHONE);
+    twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Start>
     <Stream url="${websocketUrl}" track="both_tracks" />
   </Start>
   <Dial>${DISPATCHER_PHONE}</Dial>
 </Response>`;
+  } else {
+    // ONE-WAY MODE: Just transcribe caller (for solo testing)
+    console.log('🎙️  One-way mode: Call will transcribe caller only');
+    twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Start>
+    <Stream url="${websocketUrl}" />
+  </Start>
+  <Say voice="alice">911, what is your emergency? Please describe the situation.</Say>
+  <Pause length="3600"/>
+</Response>`;
+  }
 
   // Set Content-Type explicitly
   res.set('Content-Type', 'text/xml');
   res.send(twiml);
   
   console.log('✅ TwiML response sent with WebSocket URL:', websocketUrl);
-  console.log('📱 Call will ring:', DISPATCHER_PHONE);
 });
 
 // WebSocket handler for Twilio Media Streams
@@ -335,6 +354,9 @@ wss.on('connection', (ws: WSType, req) => {
   let callSid: string | null = null;
   let deepgramConnection: any = null;
   let messageCount = 0;
+  let audioPacketCount = 0;
+  let firstAudioPacketTime: number | null = null;
+  let lastAudioPacketTime: number | null = null;
 
   ws.on('message', async (message: Buffer) => {
     messageCount++;
@@ -349,18 +371,43 @@ wss.on('connection', (ws: WSType, req) => {
           console.log(`🚨 Call started: ${callSid}`);
           console.log(`   Stream SID: ${msg.start.streamSid}`);
           console.log(`   Media format: ${msg.start.mediaFormat.encoding} @ ${msg.start.mediaFormat.sampleRate}Hz`);
+          console.log(`   Track config: ${msg.start.tracks?.join(', ') || 'inbound_track (default)'}`);
+
+          // Detect if this is a two-way call (both tracks) or one-way (inbound only)
+          // Check for both_tracks OR presence of both inbound and outbound
+          const isTwoWay = msg.start.tracks?.includes('both_tracks') || 
+                          (msg.start.tracks?.includes('inbound') && msg.start.tracks?.includes('outbound')) ||
+                          false;
+          console.log(`   Mode: ${isTwoWay ? 'TWO-WAY (both tracks)' : 'ONE-WAY (caller only)'}`);
+          console.log(`   ⚠️  isTwoWay detection result: ${isTwoWay}`);
 
           // Create call record in Supabase
           await createCallRecord(callSid, msg.start.streamSid);
 
-          // Initialize Deepgram connection
-          deepgramConnection = await initDeepgramConnection(callSid);
+          // Initialize Deepgram connection with correct channel configuration
+          deepgramConnection = await initDeepgramConnection(callSid, isTwoWay);
           activeConnections.set(callSid, deepgramConnection);
           break;
 
         case 'media':
           // Forward audio to Deepgram
           if (deepgramConnection && msg.media.payload) {
+            audioPacketCount++;
+            const now = Date.now();
+            
+            if (!firstAudioPacketTime) {
+              firstAudioPacketTime = now;
+              console.log(`🎵 First audio packet received`);
+            }
+            lastAudioPacketTime = now;
+            
+            // Log every 100 packets to track throughput
+            if (audioPacketCount % 100 === 0) {
+              const elapsed = (now - firstAudioPacketTime) / 1000;
+              const packetsPerSec = audioPacketCount / elapsed;
+              console.log(`🎵 Audio packets: ${audioPacketCount} (${packetsPerSec.toFixed(1)}/sec)`);
+            }
+            
             const audioBuffer = Buffer.from(msg.media.payload, 'base64');
             deepgramConnection.send(audioBuffer);
           }
@@ -415,59 +462,83 @@ wss.on('connection', (ws: WSType, req) => {
 });
 
 // Initialize Deepgram live transcription for a call
-async function initDeepgramConnection(callSid: string) {
+async function initDeepgramConnection(callSid: string, isTwoWay: boolean = false) {
   console.log(`🎤 Initializing Deepgram for call: ${callSid}`);
+  console.log(`   Configuration: ${isTwoWay ? 'Stereo (2 channels)' : 'Mono (1 channel)'}`);
 
   const deepgram = createClient(DEEPGRAM_API_KEY);
 
-  const connection = deepgram.listen.live({
+  // Configure based on whether it's a two-way call or not
+  const deepgramConfig: any = {
     encoding: 'mulaw',
     sample_rate: 8000,
-    channels: 2,  // Changed to 2 for both_tracks (caller + dispatcher)
+    channels: isTwoWay ? 2 : 1,  // 2 for both_tracks, 1 for inbound only
     punctuate: true,
-    interim_results: true,
+    interim_results: !isTwoWay,  // Disable interim for 2-way to reduce lag
     smart_format: true,
-    model: 'nova-2',
-    multichannel: true,  // Enable multichannel transcription
-  });
+    model: isTwoWay ? 'nova-2-phonecall' : 'nova-2',  // Phone-optimized for 2-way
+  };
+
+  // Only enable multichannel if we have 2 channels
+  if (isTwoWay) {
+    deepgramConfig.multichannel = true;
+  }
+
+  const connection = deepgram.listen.live(deepgramConfig);
 
   // Handle transcript events
   connection.on(LiveTranscriptionEvents.Open, () => {
     console.log(`✅ Deepgram connection opened for call: ${callSid}`);
   });
 
+  // Track metadata for debugging
+  connection.on(LiveTranscriptionEvents.Metadata, (data: any) => {
+    console.log(`📊 Deepgram metadata for ${callSid}:`, {
+      request_id: data.request_id,
+      model_info: data.model_info,
+      channels: data.channels
+    });
+  });
+
   connection.on(LiveTranscriptionEvents.Transcript, async (data: any) => {
-    // Debug: Log the entire data structure to understand what we're getting
-    // console.log('🔍 Raw Deepgram data:', JSON.stringify(data).substring(0, 200) + '...');
-    
-    // With multichannel, Deepgram sends separate events for each channel
-    // channel_index tells us which channel this is
-    const channelIndex = data.channel_index?.[0]; // First element is the channel number
+    const receiveTime = Date.now();
     const transcript = data.channel?.alternatives?.[0]?.transcript;
     const isFinal = data.is_final;
     const confidence = data.channel?.alternatives?.[0]?.confidence;
+    const duration = data.duration; // Audio duration from Deepgram
+    const start = data.start; // Start time in audio stream
     
     // Skip if no transcript
     if (!transcript) {
       return;
     }
     
-    // Channel 0 = Caller (inbound)
-    // Channel 1 = Dispatcher (outbound)  
-    const sender = channelIndex === 0 ? 'caller' : 'dispatcher';
+    // Determine sender based on channel (if multichannel)
+    let sender: 'caller' | 'dispatcher' = 'caller';
+    
+    if (isTwoWay && data.channel_index) {
+      // In two-way mode with multichannel:
+      // channel_index[0] = 0 means caller, 1 means dispatcher
+      const channelIndex = data.channel_index[0];
+      sender = channelIndex === 0 ? 'caller' : 'dispatcher';
+    }
+    // In one-way mode, everything is from caller
 
     if (isFinal) {
       console.log(`\n📝 [FINAL] ${sender.toUpperCase()}: "${transcript}"`);
-      console.log(`   Channel: ${channelIndex}, Confidence: ${confidence}`);
+      console.log(`   Confidence: ${confidence}`);
+      console.log(`   ⏱️  Audio duration: ${duration}s, Audio start: ${start}s`);
       
-      // Store final transcript in Supabase
+      const storeStartTime = Date.now();
+      // Store final transcript
       await storeTranscript(callSid, sender, transcript, true, confidence);
-    } else {
-      // Partial transcript - can be useful for real-time UI updates
-      console.log(`⏳ [PARTIAL] ${sender.toUpperCase()}: "${transcript}"`);
+      const storeEndTime = Date.now();
       
-      // Optionally store partial transcripts (commented out to reduce DB writes)
-      // await storeTranscript(callSid, sender, transcript, false, confidence);
+      console.log(`   ⏱️  Storage latency: ${storeEndTime - storeStartTime}ms`);
+      console.log(`   ⏱️  Total processing time: ${storeEndTime - receiveTime}ms`);
+    } else {
+      // Partial transcript
+      console.log(`⏳ [PARTIAL] ${sender.toUpperCase()}: "${transcript}"`);
     }
   });
 
