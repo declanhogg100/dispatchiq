@@ -315,13 +315,13 @@ app.all('/twilio/voice', (req, res) => {
 
   let twiml;
 
-  if (DISPATCHER_PHONE) {
+    if (DISPATCHER_PHONE) {
     // TWO-WAY MODE: Connect caller to dispatcher (for demo with friend)
     console.log('📱 Two-way mode: Call will ring dispatcher at', DISPATCHER_PHONE);
     twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Start>
-    <Stream url="${websocketUrl}" track="both_tracks" />
+    <Stream url="${websocketUrl}" track="inbound_track" />
   </Start>
   <Dial>${DISPATCHER_PHONE}</Dial>
 </Response>`;
@@ -373,13 +373,12 @@ wss.on('connection', (ws: WSType, req) => {
           console.log(`   Media format: ${msg.start.mediaFormat.encoding} @ ${msg.start.mediaFormat.sampleRate}Hz`);
           console.log(`   Track config: ${msg.start.tracks?.join(', ') || 'inbound_track (default)'}`);
 
-          // Detect if this is a two-way call (both tracks) or one-way (inbound only)
-          // Check for both_tracks OR presence of both inbound and outbound
-          const isTwoWay = msg.start.tracks?.includes('both_tracks') || 
-                          (msg.start.tracks?.includes('inbound') && msg.start.tracks?.includes('outbound')) ||
-                          false;
-          console.log(`   Mode: ${isTwoWay ? 'TWO-WAY (both tracks)' : 'ONE-WAY (caller only)'}`);
-          console.log(`   ⚠️  isTwoWay detection result: ${isTwoWay}`);
+          // For demo purposes, ALWAYS use single-channel (caller only)
+          // Even if Twilio sends both tracks, we'll ignore the dispatcher track
+          // This gives us real-time performance since we only process 1 audio stream
+          const isTwoWay = false; // Force single-channel for performance
+          console.log(`   Mode: SINGLE-CHANNEL (caller only) for real-time performance`);
+          console.log(`   ⚠️  Multichannel disabled to prevent lag`);
 
           // Create call record in Supabase
           await createCallRecord(callSid, msg.start.streamSid);
@@ -464,26 +463,23 @@ wss.on('connection', (ws: WSType, req) => {
 // Initialize Deepgram live transcription for a call
 async function initDeepgramConnection(callSid: string, isTwoWay: boolean = false) {
   console.log(`🎤 Initializing Deepgram for call: ${callSid}`);
-  console.log(`   Configuration: ${isTwoWay ? 'Stereo (2 channels)' : 'Mono (1 channel)'}`);
+  console.log(`   Configuration: Mono (1 channel - caller only)`);
 
   const deepgram = createClient(DEEPGRAM_API_KEY);
 
-  // Configure based on whether it's a two-way call or not
+  // Always use single-channel with optimal settings for real-time performance
   const deepgramConfig: any = {
     encoding: 'mulaw',
     sample_rate: 8000,
-    channels: isTwoWay ? 2 : 1,  // 2 for both_tracks, 1 for inbound only
+    channels: 1,  // Single channel = caller only
     punctuate: true,
-    interim_results: !isTwoWay,  // Disable interim for 2-way to reduce lag
+    interim_results: true,  // Enable interim for live feel
     smart_format: true,
-    model: isTwoWay ? 'nova-2-phonecall' : 'nova-2',  // Phone-optimized for 2-way
+    model: 'nova-2-phonecall',  // Use accurate model since we're only processing 1 channel
+    endpointing: 300,  // Aggressive endpointing (300ms silence = end of utterance)
   };
 
-  // Only enable multichannel if we have 2 channels
-  if (isTwoWay) {
-    deepgramConfig.multichannel = true;
-  }
-
+  // No multichannel needed - we only process caller audio
   const connection = deepgram.listen.live(deepgramConfig);
 
   // Handle transcript events
@@ -513,16 +509,8 @@ async function initDeepgramConnection(callSid: string, isTwoWay: boolean = false
       return;
     }
     
-    // Determine sender based on channel (if multichannel)
-    let sender: 'caller' | 'dispatcher' = 'caller';
-    
-    if (isTwoWay && data.channel_index) {
-      // In two-way mode with multichannel:
-      // channel_index[0] = 0 means caller, 1 means dispatcher
-      const channelIndex = data.channel_index[0];
-      sender = channelIndex === 0 ? 'caller' : 'dispatcher';
-    }
-    // In one-way mode, everything is from caller
+    // Always caller since we're in single-channel mode
+    const sender: 'caller' | 'dispatcher' = 'caller';
 
     if (isFinal) {
       console.log(`\n📝 [FINAL] ${sender.toUpperCase()}: "${transcript}"`);
@@ -537,8 +525,8 @@ async function initDeepgramConnection(callSid: string, isTwoWay: boolean = false
       console.log(`   ⏱️  Storage latency: ${storeEndTime - storeStartTime}ms`);
       console.log(`   ⏱️  Total processing time: ${storeEndTime - receiveTime}ms`);
     } else {
-      // Partial transcript
-      console.log(`⏳ [PARTIAL] ${sender.toUpperCase()}: "${transcript}"`);
+      // Partial transcript - comment out logging to reduce noise/latency
+      // console.log(`⏳ [PARTIAL] ${sender.toUpperCase()}: "${transcript}"`);
     }
   });
 
