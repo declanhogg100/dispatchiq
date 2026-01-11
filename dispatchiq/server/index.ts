@@ -279,7 +279,7 @@ async function endCallRecord(callSid: string) {
   if (!supabase) return;
 
   try {
-    const { error } = await supabase
+    const { error } = await (supabase as any)
       .from('calls')
       .update({
         status: 'ended',
