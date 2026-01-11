@@ -64,7 +64,7 @@ export function ReportButton({ callId }: ReportButtonProps) {
         return (
             <button
                 onClick={download}
-                className="inline-flex items-center justify-center rounded-md text-sm font-medium ring-offset-background transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-input bg-background hover:bg-accent hover:text-accent-foreground h-9 w-9 text-blue-600"
+                className="inline-flex items-center justify-center rounded-md text-sm font-medium ring-offset-background transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-input bg-background hover:bg-blue-600 hover:text-white h-9 w-9 text-blue-600"
                 title="Download Report"
             >
                 <Download className="h-4 w-4" />
@@ -77,13 +77,13 @@ export function ReportButton({ callId }: ReportButtonProps) {
         <button
             onClick={generateReport}
             disabled={isGenerating}
-            className="inline-flex items-center justify-center rounded-md text-sm font-medium ring-offset-background transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-input bg-background hover:bg-accent hover:text-accent-foreground h-9 w-9"
+            className="inline-flex items-center justify-center rounded-md text-sm font-medium ring-offset-background transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-input bg-background text-muted-foreground hover:bg-blue-600 hover:text-white h-9 w-9"
             title="Generate Report"
         >
             {isGenerating ? (
                 <Loader2 className="h-4 w-4 animate-spin" />
             ) : (
-                <FileText className="h-4 w-4 text-muted-foreground" />
+                <FileText className="h-4 w-4" />
             )}
             <span className="sr-only">Generate Report</span>
         </button>

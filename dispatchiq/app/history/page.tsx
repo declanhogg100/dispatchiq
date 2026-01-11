@@ -44,11 +44,11 @@ export default async function HistoryPage() {
             <p className="text-muted-foreground">Review past emergency calls and generate reports.</p>
           </div>
 
-        <div className="rounded-md border bg-card">
+        <div className="rounded-md border border-border bg-card">
           <div className="relative w-full overflow-auto">
             <table className="w-full caption-bottom text-sm">
-              <thead className="[&_tr]:border-b">
-                <tr className="border-b transition-colors hover:bg-muted/50 data-[state=selected]:bg-muted">
+              <thead className="[&_tr]:border-b [&_tr]:border-border">
+                <tr className="border-b border-border transition-colors hover:bg-muted/50 data-[state=selected]:bg-muted">
                   <th className="h-12 px-4 text-left align-middle font-medium text-muted-foreground">Date</th>
                   <th className="h-12 px-4 text-left align-middle font-medium text-muted-foreground">Type</th>
                   <th className="h-12 px-4 text-left align-middle font-medium text-muted-foreground">Location</th>
@@ -67,7 +67,7 @@ export default async function HistoryPage() {
                     : '-';
                   
                   return (
-                    <tr key={call.id} className="border-b transition-colors hover:bg-muted/50 data-[state=selected]:bg-muted">
+                    <tr key={call.id} className="border-b border-border transition-colors hover:bg-muted/50 data-[state=selected]:bg-muted">
                       <td className="p-4 align-middle font-medium">
                         {formatDate(call.started_at)}
                       </td>
@@ -102,7 +102,7 @@ export default async function HistoryPage() {
                           <DeleteCallButton callId={call.id} />
                           <Link 
                             href={`/history/${call.id}`}
-                            className="inline-flex items-center justify-center rounded-md text-sm font-medium ring-offset-background transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 hover:bg-accent hover:text-accent-foreground h-9 px-3"
+                            className="inline-flex items-center justify-center rounded-md text-sm font-medium ring-offset-background transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 hover:bg-accent hover:text-accent-foreground h-9 px-3 whitespace-nowrap"
                           >
                             View Details <ChevronRight className="ml-1 h-4 w-4" />
                           </Link>

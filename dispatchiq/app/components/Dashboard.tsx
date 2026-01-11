@@ -4,7 +4,7 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { Header } from './Header';
 import { Transcript } from './Transcript';
 import { IncidentState } from './IncidentState';
-import { NextQuestion } from './NextQuestion';
+import { CriticalBlindSpots } from './CriticalBlindSpots';
 import { MapPanel } from './MapPanel';
 import {
   AnalysisResponsePayload,
@@ -43,6 +43,7 @@ export default function Dashboard() {
   });
   const [urgency, setUrgency] = useState<Urgency>('Low');
   const [nextQuestion, setNextQuestion] = useState<string | null>(null);
+  const [missingKeys, setMissingKeys] = useState<(keyof IncidentDetails)[]>([]);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const lastAnalyzedIdRef = useRef<string | null>(null);
   const endedCallSidRef = useRef<string | null>(null);
@@ -111,6 +112,7 @@ export default function Dashboard() {
     });
     setUrgency('Low');
     setNextQuestion(null);
+    setMissingKeys([]);
     setShowReportButton(false);
     setReportUrl(null);
     setReport(null);
@@ -196,6 +198,9 @@ export default function Dashboard() {
                     if (typeof data.nextQuestion !== 'undefined') {
                         setNextQuestion(data.nextQuestion);
                     }
+                    if (Array.isArray(data.missing)) {
+                        setMissingKeys(data.missing);
+                    }
                 } else if (data.type === 'geo' || data.type === 'location_update') {
                     // Server-pushed precise coordinates from phone API
                     console.log('[Map] ✅ WS geolocation update received:', data);
@@ -213,6 +218,11 @@ export default function Dashboard() {
                     endedCallSidRef.current = data.call_sid;
                     setStatus('connected');
                     setShowReportButton(true);
+                    // Reset map-related state to stop further lookups and clear the map
+                    setEtaMinutes(null);
+                    setCoords(null);
+                    // Clear blind-spot list for idle state
+                    setMissingKeys([]);
                 }
             } catch (error) {
                 console.error('❌ Error parsing WebSocket message:', error);
@@ -270,7 +280,7 @@ export default function Dashboard() {
       }
 
       const data = (await response.json()) as AnalysisResponsePayload;
-      const { updates, nextQuestion: suggestedQuestion } = data;
+      const { updates, nextQuestion: suggestedQuestion, missing } = data;
 
       if (updates) {
         const { urgency: updatedUrgency, ...fields } = updates;
@@ -282,6 +292,9 @@ export default function Dashboard() {
 
       if (suggestedQuestion !== undefined) {
         setNextQuestion(suggestedQuestion);
+      }
+      if (Array.isArray(missing)) {
+        setMissingKeys(missing as any);
       }
     } catch (error) {
       console.error(error);
@@ -337,9 +350,13 @@ export default function Dashboard() {
     };
   }, [messages, callAnalysisApi]);
 
-  // Fetch ETA when location or precise coords change
+  // Fetch ETA when location or precise coords change (only during active call)
   useEffect(() => {
     const fetchEta = async () => {
+      if (status !== 'listening' || !currentCallSid) {
+        console.log('[Map] Skipping ETA; no active call', { status, currentCallSid });
+        return;
+      }
       // Prefer precise coordinates if available
       if (coords?.lat && coords?.lon) {
         console.log('[Map] 📍 Fetching ETA by coords', coords);
@@ -401,7 +418,7 @@ export default function Dashboard() {
       }
     };
     fetchEta();
-  }, [incidentDetails.location, coords?.lat, coords?.lon]);
+  }, [incidentDetails.location, coords?.lat, coords?.lon, status, currentCallSid]);
 
   return (
     <div className="flex h-screen w-full flex-col bg-background">
@@ -416,9 +433,14 @@ export default function Dashboard() {
         {/* Right Column: Intelligence */}
         <section className="flex flex-1 flex-col gap-6 overflow-y-auto pr-2">
             
-            {/* Top: Next Best Question (Hero) */}
+            {/* Top: Critical Blind Spots */}
             <div className="w-full">
-                <NextQuestion question={nextQuestion} loading={isAnalyzing || (status === 'listening' && !nextQuestion)} />
+                <CriticalBlindSpots 
+                  missing={missingKeys as any}
+                  loading={isAnalyzing}
+                  inactive={status !== 'listening' || !currentCallSid}
+                  placeholder={'No active call. Critical gaps will appear here.'}
+                />
             </div>
 
             {/* Middle: Incident State */}
