@@ -243,7 +243,8 @@ export default function Dashboard() {
                     setMissingKeys([]);
                 }
             } catch (error) {
-                console.error('❌ Error parsing WebSocket message:', error);
+                // Non-fatal: ignore malformed frames or heartbeat noise in dev
+                console.warn('⚠️ Error parsing WebSocket message:', error);
             }
         };
 
