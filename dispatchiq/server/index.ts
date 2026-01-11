@@ -28,9 +28,10 @@ import type { WebSocket as WSType } from 'ws';
 const PORT = process.env.PORT || 3001;
 const PUBLIC_HOST = process.env.PUBLIC_HOST;
 const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
-const AURA_VOICE = process.env.AURA_VOICE || 'aura-2-rabbit'; // placeholder voice
+const AURA_VOICE = process.env.AURA_VOICE || 'aura-asteria-en'; // default to known working voice
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const VOICE_MODE = (process.env.VOICE_MODE || 'ai').toLowerCase(); // 'ai' | 'dispatcher'
 
 if (!DEEPGRAM_API_KEY) {
   console.error('❌ DEEPGRAM_API_KEY is required');
@@ -207,7 +208,7 @@ interface CallState {
 const callStateMap = new Map<string, CallState>();
 const callSessionMap = new Map<
   string,
-  { ws: WSType; streamSid: string; tts?: WebSocket; speaking?: boolean; outSeq?: number }
+  { ws: WSType; streamSid: string; tts?: WebSocket; speaking?: boolean; outSeq?: number; canSpeak?: boolean }
 >();
 
 // Helper: Create call record in Supabase
@@ -343,28 +344,36 @@ app.all('/twilio/voice', (req, res) => {
   // Your dispatcher phone number (optional)
   const DISPATCHER_PHONE = process.env.DISPATCHER_PHONE;
 
+  // Determine routing mode: prefer query param for quick overrides; fall back to env
+  const requestedMode = (typeof req.query?.mode === 'string' ? (req.query.mode as string) : VOICE_MODE).toLowerCase();
+  const isDispatcherMode = requestedMode === 'dispatcher' && !!DISPATCHER_PHONE;
+  console.log(`🎛️  Voice mode selected: ${requestedMode}${isDispatcherMode ? ' (dispatcher)' : ' (ai)'}${DISPATCHER_PHONE ? '' : ' [no DISPATCHER_PHONE set]'}`);
+
   let twiml;
 
-  if (DISPATCHER_PHONE) {
-    // TWO-WAY MODE: Connect caller to dispatcher (for demo with friend)
-    console.log('📱 Two-way mode: Call will ring dispatcher at', DISPATCHER_PHONE);
+  if (isDispatcherMode) {
+    // DISPATCHER MODE: Ring dispatcher and stream audio for logging/assist
+    console.log('📱 Dispatcher mode: Call will ring', DISPATCHER_PHONE);
     twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
-    <Stream url="${websocketUrl}" track="inbound_track" />
+    <Stream url="${websocketUrl}" track="both_tracks" />
   </Connect>
   <Dial>${DISPATCHER_PHONE}</Dial>
+  <Pause length="3600"/>
 </Response>`;
   } else {
-    // ONE-WAY MODE: Just transcribe caller (for solo testing)
-    console.log('🎙️  One-way mode: Call will transcribe caller only');
+    // AI AGENT MODE: Caller talks to AI via our server
+    // Use <Connect><Stream> for BIDIRECTIONAL audio - this allows us to send TTS back to caller
+    // Note: <Connect> is inherently bidirectional - no track attribute needed (or use inbound_track)
+    // Note: <Connect> pauses TwiML execution until stream disconnects, so no <Pause> needed
+    // The initial greeting will be spoken via TTS through the WebSocket
+    console.log('🤖 AI mode: Caller will interact with AI agent (bidirectional stream)');
     twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
     <Stream url="${websocketUrl}" />
   </Connect>
-  <Say voice="alice">911, what is your emergency? Please describe the situation.</Say>
-  <Pause length="3600"/>
 </Response>`;
   }
 
@@ -414,7 +423,13 @@ wss.on('connection', (ws: WSType, req) => {
           await createCallRecord(callSid, msg.start.streamSid);
 
           // Track session and initial state
-          callSessionMap.set(callSid, { ws, streamSid: msg.start.streamSid });
+          const tracks = (msg.start.tracks || ['inbound']).map((t: string) => t.toLowerCase());
+          // With <Connect><Stream>, we can ALWAYS send audio back (bidirectional by design)
+          // The tracks array just shows what Twilio is sending TO us, not what we can send back
+          // Force canSpeak=true since we're using <Connect> not <Start>
+          const canSpeak = true;
+          console.log(`   🔊 Bidirectional mode: tracks=[${tracks.join(', ')}], canSpeak=${canSpeak} (forced for <Connect>)`);
+          callSessionMap.set(callSid, { ws, streamSid: msg.start.streamSid, canSpeak });
           callStateMap.set(callSid, {
             messages: [],
             incident: {
@@ -432,20 +447,26 @@ wss.on('connection', (ws: WSType, req) => {
           // Initialize Deepgram connection with correct channel configuration
           deepgramConnection = await initDeepgramConnection(callSid, isTwoWay);
           activeConnections.set(callSid, deepgramConnection);
+          
+          // Send initial greeting via TTS (since we're using bidirectional stream without <Say>)
+          // Small delay to ensure WebSocket is fully established
+          const currentCallSid = callSid; // Capture for closure
+          setTimeout(() => {
+            const session = callSessionMap.get(currentCallSid);
+            if (session?.canSpeak) {
+              console.log('🎙️ Sending initial greeting via TTS');
+              void startAuraTts(currentCallSid, '911, what is your emergency? Please describe the situation.');
+            }
+          }, 500);
           break;
 
         case 'media':
-          // Forward audio to Deepgram
+          // Forward only inbound/caller audio to Deepgram
           if (deepgramConnection && msg.media.payload) {
-            // If bot is speaking and caller talks, clear playback (barge-in)
-            const session = callSessionMap.get(callSid || '');
-            if (session?.speaking && session.streamSid) {
-              sendTwilioClear(session.ws, session.streamSid);
-              session.speaking = false;
-              if (session.tts) {
-                session.tts.close();
-                session.tts = undefined;
-              }
+            const track = (msg.media as any).track?.toLowerCase?.() || 'inbound';
+            if (track !== 'inbound' && track !== 'inbound_track') {
+              // Ignore outbound/media we generate ourselves or TwiML <Say>
+              break;
             }
 
             audioPacketCount++;
@@ -492,7 +513,14 @@ wss.on('connection', (ws: WSType, req) => {
           
           // Clean up TTS/session
           const session = callSessionMap.get(msg.stop.callSid);
-          if (session?.tts) session.tts.close();
+          if (session?.tts) {
+            try {
+              if ((session.tts as any).readyState === WebSocket.OPEN) {
+                (session.tts as any).close();
+              }
+            } catch {}
+            session.tts = undefined as any;
+          }
           callSessionMap.delete(msg.stop.callSid);
 
           // Generate final report (best-effort) then drop state
@@ -523,7 +551,14 @@ wss.on('connection', (ws: WSType, req) => {
     }
     if (callSid) {
       const session = callSessionMap.get(callSid);
-      if (session?.tts) session.tts.close();
+      if (session?.tts) {
+        try {
+          if ((session.tts as any).readyState === WebSocket.OPEN) {
+            (session.tts as any).close();
+          }
+        } catch {}
+        session.tts = undefined as any;
+      }
       callSessionMap.delete(callSid);
     }
   });
@@ -540,7 +575,14 @@ wss.on('connection', (ws: WSType, req) => {
     }
     if (callSid) {
       const session = callSessionMap.get(callSid);
-      if (session?.tts) session.tts.close();
+      if (session?.tts) {
+        try {
+          if ((session.tts as any).readyState === WebSocket.OPEN) {
+            (session.tts as any).close();
+          }
+        } catch {}
+        session.tts = undefined as any;
+      }
       callSessionMap.delete(callSid);
     }
   });
@@ -567,6 +609,13 @@ async function initDeepgramConnection(callSid: string, isTwoWay: boolean = false
 
   // No multichannel needed - we only process caller audio
   const connection = deepgram.listen.live(deepgramConfig);
+
+  // Keepalive for Deepgram connection
+  const keepAliveInterval = setInterval(() => {
+    if (connection.getReadyState() === 1) { // OPEN
+      connection.keepAlive();
+    }
+  }, 3000);
 
   // Handle transcript events
   connection.on(LiveTranscriptionEvents.Open, () => {
@@ -625,8 +674,17 @@ async function initDeepgramConnection(callSid: string, isTwoWay: boolean = false
         void analyzeAndBroadcast(callSid, state);
       }
     } else {
-      // Partial transcript - comment out logging to reduce noise/latency
-      // console.log(`⏳ [PARTIAL] ${sender.toUpperCase()}: "${transcript}"`);
+      // Partial transcript: use for barge-in detection while TTS is speaking
+      const session = callSessionMap.get(callSid);
+      if (session?.speaking && session.streamSid) {
+        console.log('🛑 Barge-in detected from caller speech. Clearing TTS playback.');
+        try { sendTwilioClear(session.ws, session.streamSid); } catch (e) { console.error('❌ Failed to send clear during barge-in:', e); }
+        session.speaking = false;
+        if (session.tts && (session.tts as any)?.abort) {
+          try { (session.tts as any).abort(); } catch {}
+          session.tts = undefined as any;
+        }
+      }
     }
   });
 
@@ -636,6 +694,7 @@ async function initDeepgramConnection(callSid: string, isTwoWay: boolean = false
 
   connection.on(LiveTranscriptionEvents.Close, () => {
     console.log(`🔌 Deepgram connection closed for call: ${callSid}`);
+    clearInterval(keepAliveInterval);
   });
 
   return connection;
@@ -644,22 +703,33 @@ async function initDeepgramConnection(callSid: string, isTwoWay: boolean = false
 // --- LLM + TTS helpers ---
 
 function sendTwilioMedia(session: { ws: WSType; streamSid: string }, payloadBase64: string) {
+  // Check WebSocket state before sending
+  const wsState = session.ws.readyState;
+  if (wsState !== 1) { // 1 = OPEN
+    console.error(`❌ Cannot send media: WebSocket not open (state: ${wsState})`);
+    return;
+  }
+  
   // Twilio expects media messages with an incrementing chunk and timestamp
   const chunk = ((session as any).outSeq ?? 0) + 1;
   (session as any).outSeq = chunk;
   const timestamp = Date.now().toString();
-  const message = {
+  const message: any = {
     event: 'media',
     streamSid: session.streamSid,
     media: {
       payload: payloadBase64,
-      track: 'outbound_track',
-      chunk: chunk.toString(),
-      timestamp,
     },
   };
   try {
     session.ws.send(JSON.stringify(message));
+    if (chunk === 1) {
+      console.log('📤 Sent first outbound audio chunk to Twilio');
+      console.log(`   StreamSid: ${session.streamSid}`);
+      console.log(`   Payload size: ${payloadBase64.length} chars`);
+    } else if (chunk % 50 === 0) {
+      console.log(`📤 Outbound audio chunks sent: ${chunk}`);
+    }
   } catch (error) {
     console.error('❌ Failed to send media to Twilio:', error);
   }
@@ -674,53 +744,90 @@ function sendTwilioClear(ws: WSType, streamSid: string) {
 }
 
 async function startAuraTts(callSid: string, text: string) {
+  console.log(`🚀 Starting Aura TTS for ${callSid} with text: "${text}"`);
   const session = callSessionMap.get(callSid);
-  if (!session) return;
-
-  // Close any existing TTS stream for this call
-  if (session.tts) {
-    session.tts.close();
-    session.tts = undefined;
+  if (!session) {
+    console.error(`❌ No session found for ${callSid} in startAuraTts`);
+    return;
   }
 
-  const ttsUrl = `wss://api.deepgram.com/v1/speak?encoding=mulaw&sample_rate=8000&voice=${encodeURIComponent(AURA_VOICE)}`;
-  const headers = {
-    Authorization: `Token ${DEEPGRAM_API_KEY}`,
-  };
+  // Abort any existing TTS stream for this call
+  if (session.tts && (session.tts as any)?.abort) {
+    try { (session.tts as any).abort(); } catch {}
+    session.tts = undefined as any;
+  }
 
-  const ttsWs = new WebSocket(ttsUrl, { headers });
-  session.tts = ttsWs as any;
+  const controller = new AbortController();
+  session.tts = controller as any;
   session.speaking = true;
 
-  ttsWs.on('open', () => {
-    try {
-      ttsWs.send(JSON.stringify({ text }));
-    } catch (error) {
-      console.error('❌ Error sending TTS text:', error);
+  const ttsUrl = `https://api.deepgram.com/v1/speak?model=${encodeURIComponent(AURA_VOICE)}&encoding=mulaw&sample_rate=8000`;
+  try {
+    const resp = await fetch(ttsUrl, {
+      method: 'POST',
+      headers: {
+        Authorization: `Token ${DEEPGRAM_API_KEY}`,
+        'Content-Type': 'application/json',
+        Accept: 'audio/mulaw',
+      },
+      body: JSON.stringify({ text }),
+      signal: controller.signal,
+    } as any);
+
+    if (!resp.ok || !resp.body) {
+      console.error(`❌ Aura TTS HTTP error: ${resp.status} ${resp.statusText}`);
+      session.speaking = false;
+      session.tts = undefined as any;
+      return;
     }
-  });
 
-  ttsWs.on('message', (data: any) => {
-    // Deepgram streams raw audio bytes; forward as base64 payload to Twilio
-    const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data);
-    const payload = buffer.toString('base64');
-    sendTwilioMedia(session, payload);
-  });
+    console.log('🔊 TTS HTTP stream started');
+    let loggedOnce = false;
+    const reader: any = (resp.body as any).getReader ? (resp.body as any).getReader() : null;
 
-  ttsWs.on('close', () => {
-    session.speaking = false;
-    session.tts = undefined;
-  });
-
-  ttsWs.on('error', (error) => {
-    console.error('❌ Aura TTS error:', error);
-    session.speaking = false;
-    session.tts = undefined;
-  });
+    if (reader) {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (!value) continue;
+        const buffer = Buffer.isBuffer(value) ? value : Buffer.from(value);
+        const payload = buffer.toString('base64');
+        sendTwilioMedia(session, payload);
+        if (!loggedOnce) {
+          console.log('🎵 Receiving TTS audio chunks from Deepgram (HTTP)...');
+          loggedOnce = true;
+        }
+      }
+    } else {
+      // Node 18+ web streams are async iterable
+      for await (const chunk of resp.body as any) {
+        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        const payload = buffer.toString('base64');
+        sendTwilioMedia(session, payload);
+        if (!loggedOnce) {
+          console.log('🎵 Receiving TTS audio chunks from Deepgram (HTTP)...');
+          loggedOnce = true;
+        }
+      }
+    }
+  } catch (error) {
+    if ((error as any).name === 'AbortError') {
+      console.log('🛑 TTS HTTP stream aborted');
+    } else {
+      console.error('❌ Aura TTS HTTP error:', error);
+    }
+  } finally {
+    const s = callSessionMap.get(callSid);
+    if (s) {
+      s.speaking = false;
+      s.tts = undefined as any;
+    }
+  }
 }
 
 // Call Gemini analysis via Next API and broadcast updates
 async function analyzeAndBroadcast(callSid: string, state: CallState) {
+  console.log(`🔍 Starting analysis for ${callSid}...`);
   try {
     const response = await fetch('http://localhost:3000/api/analyze', {
       method: 'POST',
@@ -736,6 +843,8 @@ async function analyzeAndBroadcast(callSid: string, state: CallState) {
       return;
     }
     const data = await response.json();
+    console.log(`🧠 Analysis result for ${callSid}:`, JSON.stringify(data, null, 2)); // Debug log
+
     const { updates, nextQuestion } = data;
     if (updates) {
       const { urgency, ...fields } = updates;
@@ -745,11 +854,19 @@ async function analyzeAndBroadcast(callSid: string, state: CallState) {
     if (nextQuestion !== undefined) {
       const prev = state.nextQuestion;
       state.nextQuestion = nextQuestion;
+      
+      console.log(`🤔 Question check: Prev="${prev}", New="${nextQuestion}"`);
+      
       if (nextQuestion && nextQuestion !== prev) {
         const session = callSessionMap.get(callSid);
-        if (session?.streamSid) {
+        if (session?.streamSid && session?.canSpeak) {
+          console.log(`🤖 AI decided to speak: "${nextQuestion}"`);
           void startAuraTts(callSid, nextQuestion);
+        } else {
+          console.warn(`⚠️ Cannot speak: Media stream is inbound-only; skipping TTS for ${callSid}`);
         }
+      } else {
+          console.log('🤐 AI decided NOT to speak (question same or empty)');
       }
     }
 
