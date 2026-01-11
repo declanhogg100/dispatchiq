@@ -1,5 +1,4 @@
 import { NextResponse } from 'next/server';
-import PDFDocument from 'pdfkit';
 import {
   IncidentDetails,
   ReportRequestPayload,
@@ -252,6 +251,9 @@ function parseModelJson(text: string): ReportContent | null {
 }
 
 async function renderPdf(report: ReportContent): Promise<Buffer> {
+  // Dynamically load pdfkit (standalone build) to avoid build-time bundling issues
+  const { default: PDFDocument } = await import('pdfkit/js/pdfkit.standalone.js');
+
   return new Promise((resolve) => {
     const doc = new PDFDocument({ margin: 50 });
     const chunks: Buffer[] = [];
@@ -358,14 +360,10 @@ async function uploadPdf(
 
   const callId = (meta.callId || 'call').replace(/\s+/g, '-');
   const filePath = `${callId}/${Date.now()}.pdf`;
-  const arrayBuffer = pdfBuffer.buffer.slice(
-    pdfBuffer.byteOffset,
-    pdfBuffer.byteOffset + pdfBuffer.byteLength,
-  );
 
   const { error } = await supabase.storage
     .from(REPORT_BUCKET)
-    .upload(filePath, arrayBuffer, {
+    .upload(filePath, pdfBuffer, {
       contentType: 'application/pdf',
       upsert: true,
     });

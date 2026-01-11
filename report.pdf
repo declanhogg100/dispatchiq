@@ -1,0 +1,9 @@
+HTTP/1.1 500 Internal Server Error
+vary: rsc, next-router-state-tree, next-router-prefetch, next-router-segment-prefetch
+content-type: application/json
+Date: Sun, 11 Jan 2026 00:11:03 GMT
+Connection: keep-alive
+Keep-Alive: timeout=5
+Transfer-Encoding: chunked
+
+{"report":"Report generation failed. Please retry after verifying GEMINI_API_KEY and GEMINI_MODEL_ID."}
