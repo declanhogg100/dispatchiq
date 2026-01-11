@@ -19,7 +19,7 @@ if (existsSync(envLocalPath)) {
 
 import express from 'express';
 import { createServer } from 'http';
-import { WebSocketServer } from 'ws';
+import { WebSocketServer, WebSocket } from 'ws';
 import { createClient, LiveTranscriptionEvents } from '@deepgram/sdk';
 import { createClient as createSupabaseClient } from '@supabase/supabase-js';
 import type { WebSocket as WSType } from 'ws';
@@ -28,6 +28,7 @@ import type { WebSocket as WSType } from 'ws';
 const PORT = process.env.PORT || 3001;
 const PUBLIC_HOST = process.env.PUBLIC_HOST;
 const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
+const AURA_VOICE = process.env.AURA_VOICE || 'aura-2-rabbit'; // placeholder voice
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
@@ -180,6 +181,35 @@ const activeConnections = new Map<string, any>();
 // Store call IDs mapping (callSid -> database call_id)
 const callIdMap = new Map<string, string>();
 
+// Simple state tracking per call for LLM + TTS
+type Urgency = 'Low' | 'Medium' | 'Critical';
+interface IncidentDetails {
+  location: string | null;
+  type: string | null;
+  injuries: string | null;
+  threatLevel: string | null;
+  peopleCount: string | null;
+  callerRole: string | null;
+}
+interface TranscriptMessage {
+  id: string;
+  sender: 'caller' | 'dispatcher';
+  text: string;
+  timestamp: Date;
+  isPartial?: boolean;
+}
+interface CallState {
+  messages: TranscriptMessage[];
+  incident: IncidentDetails;
+  urgency: Urgency;
+  nextQuestion: string | null;
+}
+const callStateMap = new Map<string, CallState>();
+const callSessionMap = new Map<
+  string,
+  { ws: WSType; streamSid: string; tts?: WebSocket; speaking?: boolean }
+>();
+
 // Helper: Create call record in Supabase
 async function createCallRecord(callSid: string, streamSid: string) {
   console.log(`💾 Attempting to create call record for ${callSid}...`);
@@ -315,14 +345,14 @@ app.all('/twilio/voice', (req, res) => {
 
   let twiml;
 
-    if (DISPATCHER_PHONE) {
+  if (DISPATCHER_PHONE) {
     // TWO-WAY MODE: Connect caller to dispatcher (for demo with friend)
     console.log('📱 Two-way mode: Call will ring dispatcher at', DISPATCHER_PHONE);
     twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Start>
+  <Connect>
     <Stream url="${websocketUrl}" track="inbound_track" />
-  </Start>
+  </Connect>
   <Dial>${DISPATCHER_PHONE}</Dial>
 </Response>`;
   } else {
@@ -330,9 +360,9 @@ app.all('/twilio/voice', (req, res) => {
     console.log('🎙️  One-way mode: Call will transcribe caller only');
     twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Start>
+  <Connect>
     <Stream url="${websocketUrl}" />
-  </Start>
+  </Connect>
   <Say voice="alice">911, what is your emergency? Please describe the situation.</Say>
   <Pause length="3600"/>
 </Response>`;
@@ -383,6 +413,22 @@ wss.on('connection', (ws: WSType, req) => {
           // Create call record in Supabase
           await createCallRecord(callSid, msg.start.streamSid);
 
+          // Track session and initial state
+          callSessionMap.set(callSid, { ws, streamSid: msg.start.streamSid });
+          callStateMap.set(callSid, {
+            messages: [],
+            incident: {
+              location: null,
+              type: null,
+              injuries: null,
+              threatLevel: null,
+              peopleCount: null,
+              callerRole: null,
+            },
+            urgency: 'Low',
+            nextQuestion: null,
+          });
+
           // Initialize Deepgram connection with correct channel configuration
           deepgramConnection = await initDeepgramConnection(callSid, isTwoWay);
           activeConnections.set(callSid, deepgramConnection);
@@ -391,6 +437,17 @@ wss.on('connection', (ws: WSType, req) => {
         case 'media':
           // Forward audio to Deepgram
           if (deepgramConnection && msg.media.payload) {
+            // If bot is speaking and caller talks, clear playback (barge-in)
+            const session = callSessionMap.get(callSid || '');
+            if (session?.speaking && session.streamSid) {
+              sendTwilioClear(session.ws, session.streamSid);
+              session.speaking = false;
+              if (session.tts) {
+                session.tts.close();
+                session.tts = undefined;
+              }
+            }
+
             audioPacketCount++;
             const now = Date.now();
             
@@ -417,7 +474,7 @@ wss.on('connection', (ws: WSType, req) => {
           
           // End call record in Supabase
           await endCallRecord(msg.stop.callSid);
-          
+
           // Clean up Deepgram connection
           if (deepgramConnection) {
             deepgramConnection.finish();
@@ -425,6 +482,18 @@ wss.on('connection', (ws: WSType, req) => {
               activeConnections.delete(callSid);
             }
           }
+          
+          // Clean up TTS/session
+          const session = callSessionMap.get(msg.stop.callSid);
+          if (session?.tts) session.tts.close();
+          callSessionMap.delete(msg.stop.callSid);
+
+          // Generate final report (best-effort) then drop state
+          const finalState = callStateMap.get(msg.stop.callSid);
+          if (finalState) {
+            void generateReport(msg.stop.callSid, finalState);
+          }
+          callStateMap.delete(msg.stop.callSid);
           break;
 
         default:
@@ -445,6 +514,11 @@ wss.on('connection', (ws: WSType, req) => {
         activeConnections.delete(callSid);
       }
     }
+    if (callSid) {
+      const session = callSessionMap.get(callSid);
+      if (session?.tts) session.tts.close();
+      callSessionMap.delete(callSid);
+    }
   });
 
   ws.on('error', (error) => {
@@ -456,6 +530,11 @@ wss.on('connection', (ws: WSType, req) => {
       if (callSid) {
         activeConnections.delete(callSid);
       }
+    }
+    if (callSid) {
+      const session = callSessionMap.get(callSid);
+      if (session?.tts) session.tts.close();
+      callSessionMap.delete(callSid);
     }
   });
 });
@@ -524,6 +603,20 @@ async function initDeepgramConnection(callSid: string, isTwoWay: boolean = false
       
       console.log(`   ⏱️  Storage latency: ${storeEndTime - storeStartTime}ms`);
       console.log(`   ⏱️  Total processing time: ${storeEndTime - receiveTime}ms`);
+
+      // Track and analyze latest transcript
+      const state = callStateMap.get(callSid);
+      if (state) {
+        const msgObj: TranscriptMessage = {
+          id: Date.now().toString(),
+          sender,
+          text: transcript,
+          timestamp: new Date(),
+          isPartial: false,
+        };
+        state.messages.push(msgObj);
+        void analyzeAndBroadcast(callSid, state);
+      }
     } else {
       // Partial transcript - comment out logging to reduce noise/latency
       // console.log(`⏳ [PARTIAL] ${sender.toUpperCase()}: "${transcript}"`);
@@ -539,6 +632,157 @@ async function initDeepgramConnection(callSid: string, isTwoWay: boolean = false
   });
 
   return connection;
+}
+
+// --- LLM + TTS helpers ---
+
+function sendTwilioMedia(session: { ws: WSType; streamSid: string }, payloadBase64: string) {
+  const message = {
+    event: 'media',
+    streamSid: session.streamSid,
+    media: {
+      payload: payloadBase64,
+      track: 'outbound_track',
+    },
+  };
+  try {
+    session.ws.send(JSON.stringify(message));
+  } catch (error) {
+    console.error('❌ Failed to send media to Twilio:', error);
+  }
+}
+
+function sendTwilioClear(ws: WSType, streamSid: string) {
+  try {
+    ws.send(JSON.stringify({ event: 'clear', streamSid }));
+  } catch (error) {
+    console.error('❌ Failed to send clear to Twilio:', error);
+  }
+}
+
+async function startAuraTts(callSid: string, text: string) {
+  const session = callSessionMap.get(callSid);
+  if (!session) return;
+
+  // Close any existing TTS stream for this call
+  if (session.tts) {
+    session.tts.close();
+    session.tts = undefined;
+  }
+
+  const ttsUrl = `wss://api.deepgram.com/v1/speak?encoding=mulaw&sample_rate=8000&voice=${encodeURIComponent(AURA_VOICE)}`;
+  const headers = {
+    Authorization: `Token ${DEEPGRAM_API_KEY}`,
+  };
+
+  const ttsWs = new WebSocket(ttsUrl, { headers });
+  session.tts = ttsWs as any;
+  session.speaking = true;
+
+  ttsWs.on('open', () => {
+    try {
+      ttsWs.send(JSON.stringify({ text }));
+    } catch (error) {
+      console.error('❌ Error sending TTS text:', error);
+    }
+  });
+
+  ttsWs.on('message', (data: any) => {
+    // Deepgram streams raw audio bytes; forward as base64 payload to Twilio
+    const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data);
+    const payload = buffer.toString('base64');
+    sendTwilioMedia(session, payload);
+  });
+
+  ttsWs.on('close', () => {
+    session.speaking = false;
+    session.tts = undefined;
+  });
+
+  ttsWs.on('error', (error) => {
+    console.error('❌ Aura TTS error:', error);
+    session.speaking = false;
+    session.tts = undefined;
+  });
+}
+
+// Call Gemini analysis via Next API and broadcast updates
+async function analyzeAndBroadcast(callSid: string, state: CallState) {
+  try {
+    const response = await fetch('http://localhost:3000/api/analyze', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        messages: state.messages,
+        incident: state.incident,
+        urgency: state.urgency,
+      }),
+    });
+    if (!response.ok) {
+      console.error(`❌ Analysis HTTP error ${response.status}`);
+      return;
+    }
+    const data = await response.json();
+    const { updates, nextQuestion } = data;
+    if (updates) {
+      const { urgency, ...fields } = updates;
+      if (urgency) state.urgency = urgency as Urgency;
+      state.incident = { ...state.incident, ...fields };
+    }
+    if (nextQuestion !== undefined) {
+      const prev = state.nextQuestion;
+      state.nextQuestion = nextQuestion;
+      if (nextQuestion && nextQuestion !== prev) {
+        const session = callSessionMap.get(callSid);
+        if (session?.streamSid) {
+          void startAuraTts(callSid, nextQuestion);
+        }
+      }
+    }
+
+    broadcastToDashboard({
+      type: 'analysis',
+      call_sid: callSid,
+      incident: state.incident,
+      urgency: state.urgency,
+      nextQuestion: state.nextQuestion,
+    });
+  } catch (error) {
+    console.error('❌ Error calling analysis API:', error);
+  }
+}
+
+// Generate final report via Next API
+async function generateReport(callSid: string, state: CallState) {
+  try {
+    const response = await fetch('http://localhost:3000/api/report', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        messages: state.messages,
+        incident: state.incident,
+        urgency: state.urgency,
+        callId: callSid,
+        dispatcherId: 'auto',
+        callType: state.incident.type || 'Unknown',
+        startedAt: state.messages[0]?.timestamp,
+        endedAt: state.messages[state.messages.length - 1]?.timestamp,
+      }),
+    });
+    if (!response.ok) {
+      console.error(`❌ Report HTTP error ${response.status}`);
+      return;
+    }
+    const data = await response.json();
+    broadcastToDashboard({
+      type: 'report',
+      call_sid: callSid,
+      storagePath: data.storagePath,
+      publicUrl: data.publicUrl,
+    });
+  } catch (error) {
+    console.error('❌ Error generating report:', error);
+  }
 }
 
 // Start server
