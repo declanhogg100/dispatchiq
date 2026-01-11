@@ -20,23 +20,32 @@ if (existsSync(envLocalPath)) {
 import express from 'express';
 import { createServer } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
-import { createClient, LiveTranscriptionEvents } from '@deepgram/sdk';
 import { createClient as createSupabaseClient } from '@supabase/supabase-js';
 import type { WebSocket as WSType } from 'ws';
 
 // Environment variables
 const PORT = process.env.PORT || 3001;
 const PUBLIC_HOST = process.env.PUBLIC_HOST;
-const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
-const AURA_VOICE = process.env.AURA_VOICE || 'aura-asteria-en'; // default to known working voice
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const VOICE_MODE = (process.env.VOICE_MODE || 'ai').toLowerCase(); // 'ai' | 'dispatcher'
 
-if (!DEEPGRAM_API_KEY) {
-  console.error('❌ DEEPGRAM_API_KEY is required');
+// OpenAI Realtime API config
+// Try these model names if one doesn't work:
+//   gpt-4o-realtime-preview-2024-12-17  (older, but widely available)
+//   gpt-4o-realtime-preview             (latest preview)
+//   gpt-4o-mini-realtime-preview-2024-12-17  (cheaper, might have wider access)
+const OPENAI_MODEL = process.env.OPENAI_REALTIME_MODEL || 'gpt-4o-realtime-preview-2024-12-17';
+const OPENAI_REALTIME_URL = `wss://api.openai.com/v1/realtime?model=${OPENAI_MODEL}`;
+const VOICE = process.env.OPENAI_VOICE || 'alloy'; // Options: alloy, echo, shimmer (avoid fable, onyx, nova with Twilio)
+
+if (!OPENAI_API_KEY) {
+  console.error('❌ OPENAI_API_KEY is required');
   process.exit(1);
 }
+
+console.log(`🤖 OpenAI Realtime Model: ${OPENAI_MODEL}`);
+console.log(`   If you get "model not found" errors, try setting OPENAI_REALTIME_MODEL in .env.local`);
 
 if (!PUBLIC_HOST) {
   console.warn('⚠️  PUBLIC_HOST not set. Make sure to configure Twilio with your actual WebSocket URL.');
@@ -127,7 +136,9 @@ function broadcastToDashboard(data: any) {
   });
   
   const elapsed = Date.now() - startTime;
-  console.log(`📡 Broadcast: ${successCount} sent, ${failCount} failed (${elapsed}ms)`);
+  if (successCount > 0 || failCount > 0) {
+    console.log(`📡 Broadcast: ${successCount} sent, ${failCount} failed (${elapsed}ms)`);
+  }
 }
 
 // Middleware
@@ -176,13 +187,10 @@ interface TwilioStopMessage {
 
 type TwilioMessage = TwilioStartMessage | TwilioMediaMessage | TwilioStopMessage;
 
-// Store active Deepgram connections per call
-const activeConnections = new Map<string, any>();
-
 // Store call IDs mapping (callSid -> database call_id)
 const callIdMap = new Map<string, string>();
 
-// Simple state tracking per call for LLM + TTS
+// Simple state tracking per call
 type Urgency = 'Low' | 'Medium' | 'Critical';
 interface IncidentDetails {
   location: string | null;
@@ -206,10 +214,37 @@ interface CallState {
   nextQuestion: string | null;
 }
 const callStateMap = new Map<string, CallState>();
-const callSessionMap = new Map<
-  string,
-  { ws: WSType; streamSid: string; tts?: WebSocket; speaking?: boolean; outSeq?: number; canSpeak?: boolean }
->();
+
+// Store active OpenAI connections per call
+interface CallSession {
+  twilioWs: WSType;
+  openaiWs: WebSocket;
+  streamSid: string;
+  callSid: string;
+}
+const callSessionMap = new Map<string, CallSession>();
+
+// System prompt for the 911 dispatcher AI
+const SYSTEM_INSTRUCTIONS = `You are a calm, professional 911 emergency dispatcher AI assistant. Your job is to help gather critical information from callers in distress.
+
+CRITICAL GUIDELINES:
+1. Stay calm and speak clearly at all times
+2. Ask ONE question at a time - never multiple questions
+3. Prioritize gathering: location, nature of emergency, injuries, number of people involved, any immediate threats
+4. Use short, direct questions like a real dispatcher
+5. Show empathy but stay focused on getting information
+6. If the caller is in immediate danger, prioritize their safety first
+7. Confirm critical details by repeating them back
+8. Keep responses brief - no more than 1-2 sentences
+
+START by saying: "911, what is your emergency?"
+
+After getting initial information, prioritize asking about:
+- Exact address or location
+- Type of emergency (medical, fire, police)
+- Are there any injuries?
+- Is anyone in immediate danger?
+- How many people are involved?`;
 
 // Helper: Create call record in Supabase
 async function createCallRecord(callSid: string, streamSid: string) {
@@ -333,7 +368,6 @@ app.get('/health', (req, res) => {
 });
 
 // Twilio Voice Webhook - Returns TwiML to start media stream
-// Handles both GET (for browser testing) and POST (from Twilio)
 app.all('/twilio/voice', (req, res) => {
   console.log(`📞 Incoming ${req.method} request to /twilio/voice`);
   
@@ -341,95 +375,279 @@ app.all('/twilio/voice', (req, res) => {
     ? `wss://${PUBLIC_HOST}/twilio/media`
     : `wss://YOUR_NGROK_URL_HERE/twilio/media`;
 
-  // Your dispatcher phone number (optional)
-  const DISPATCHER_PHONE = process.env.DISPATCHER_PHONE;
-
-  // Determine routing mode: prefer query param for quick overrides; fall back to env
-  const requestedMode = (typeof req.query?.mode === 'string' ? (req.query.mode as string) : VOICE_MODE).toLowerCase();
-  const isDispatcherMode = requestedMode === 'dispatcher' && !!DISPATCHER_PHONE;
-  console.log(`🎛️  Voice mode selected: ${requestedMode}${isDispatcherMode ? ' (dispatcher)' : ' (ai)'}${DISPATCHER_PHONE ? '' : ' [no DISPATCHER_PHONE set]'}`);
-
-  let twiml;
-
-  if (isDispatcherMode) {
-    // DISPATCHER MODE: Ring dispatcher and stream audio for logging/assist
-    console.log('📱 Dispatcher mode: Call will ring', DISPATCHER_PHONE);
-    twiml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Connect>
-    <Stream url="${websocketUrl}" track="both_tracks" />
-  </Connect>
-  <Dial>${DISPATCHER_PHONE}</Dial>
-  <Pause length="3600"/>
-</Response>`;
-  } else {
-    // AI AGENT MODE: Caller talks to AI via our server
-    // Use <Connect><Stream> for BIDIRECTIONAL audio - this allows us to send TTS back to caller
-    // Note: <Connect> is inherently bidirectional - no track attribute needed (or use inbound_track)
-    // Note: <Connect> pauses TwiML execution until stream disconnects, so no <Pause> needed
-    // The initial greeting will be spoken via TTS through the WebSocket
-    console.log('🤖 AI mode: Caller will interact with AI agent (bidirectional stream)');
-    twiml = `<?xml version="1.0" encoding="UTF-8"?>
+  // AI Agent mode - bidirectional audio via <Connect><Stream>
+  console.log('🤖 AI mode: Caller will interact with OpenAI Realtime API (bidirectional stream)');
+  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
     <Stream url="${websocketUrl}" />
   </Connect>
 </Response>`;
-  }
 
-  // Set Content-Type explicitly
   res.set('Content-Type', 'text/xml');
   res.send(twiml);
   
   console.log('✅ TwiML response sent with WebSocket URL:', websocketUrl);
 });
 
+// Connect to OpenAI Realtime API
+function connectToOpenAI(callSid: string, streamSid: string, twilioWs: WSType): WebSocket {
+  console.log(`🔌 Connecting to OpenAI Realtime API for call: ${callSid}`);
+  console.log(`   URL: ${OPENAI_REALTIME_URL}`);
+  
+  const openaiWs = new WebSocket(OPENAI_REALTIME_URL, {
+    headers: {
+      'Authorization': `Bearer ${OPENAI_API_KEY}`,
+      'OpenAI-Beta': 'realtime=v1'
+    }
+  });
+
+  openaiWs.on('open', () => {
+    console.log(`✅ OpenAI Realtime connection opened for call: ${callSid}`);
+    
+    // Configure the session - must match Twilio's mulaw format
+    const sessionConfig = {
+      type: 'session.update',
+      session: {
+        modalities: ['text', 'audio'],
+        instructions: SYSTEM_INSTRUCTIONS,
+        voice: VOICE,
+        input_audio_format: 'g711_ulaw',
+        output_audio_format: 'g711_ulaw',
+        input_audio_transcription: {
+          model: 'whisper-1'
+        },
+        turn_detection: {
+          type: 'server_vad',
+          threshold: 0.5,
+          prefix_padding_ms: 300,
+          silence_duration_ms: 700
+        }
+      }
+    };
+    
+    console.log(`📤 Sending session config:`, JSON.stringify(sessionConfig.session, null, 2));
+    openaiWs.send(JSON.stringify(sessionConfig));
+
+    // Send initial greeting by creating a conversation item first
+    setTimeout(() => {
+      // Method 1: Create a user message to trigger AI response
+      const conversationItem = {
+        type: 'conversation.item.create',
+        item: {
+          type: 'message',
+          role: 'user',
+          content: [
+            {
+              type: 'input_text',
+              text: '[Call connected - greet the caller]'
+            }
+          ]
+        }
+      };
+      openaiWs.send(JSON.stringify(conversationItem));
+      console.log(`📤 Sent conversation item to trigger greeting`);
+
+      // Then request a response
+      setTimeout(() => {
+        const responseCreate = {
+          type: 'response.create'
+        };
+        openaiWs.send(JSON.stringify(responseCreate));
+        console.log(`📤 Requested response from OpenAI`);
+      }, 100);
+    }, 300);
+  });
+
+  openaiWs.on('message', (data: Buffer) => {
+    try {
+      const event = JSON.parse(data.toString());
+      handleOpenAIEvent(callSid, streamSid, twilioWs, event);
+    } catch (error) {
+      console.error('❌ Error parsing OpenAI message:', error);
+    }
+  });
+
+  openaiWs.on('close', (code, reason) => {
+    console.log(`🔌 OpenAI connection closed for ${callSid}: ${code} - ${reason}`);
+  });
+
+  openaiWs.on('error', (error) => {
+    console.error(`❌ OpenAI WebSocket error for ${callSid}:`, error);
+  });
+
+  return openaiWs;
+}
+
+// Handle events from OpenAI Realtime API
+function handleOpenAIEvent(callSid: string, streamSid: string, twilioWs: WSType, event: any) {
+  const eventType = event.type;
+  
+  switch (eventType) {
+    case 'session.created':
+      console.log(`✅ OpenAI session created for ${callSid}`);
+      break;
+
+    case 'session.updated':
+      console.log(`✅ OpenAI session updated for ${callSid}`);
+      break;
+
+    case 'response.audio.delta':
+      // Stream audio back to Twilio
+      if (event.delta) {
+        // Track audio chunks for debugging
+        const session = callSessionMap.get(callSid);
+        if (session) {
+          (session as any).audioChunksSent = ((session as any).audioChunksSent || 0) + 1;
+          if ((session as any).audioChunksSent === 1) {
+            console.log(`🔊 First audio chunk received from OpenAI for ${callSid}`);
+          } else if ((session as any).audioChunksSent % 50 === 0) {
+            console.log(`🔊 Audio chunks sent to Twilio: ${(session as any).audioChunksSent}`);
+          }
+        }
+
+        const audioMessage = {
+          event: 'media',
+          streamSid: streamSid,
+          media: {
+            payload: event.delta // Already base64 encoded g711_ulaw
+          }
+        };
+        
+        if (twilioWs.readyState === WebSocket.OPEN) {
+          twilioWs.send(JSON.stringify(audioMessage));
+        } else {
+          console.warn(`⚠️  Twilio WebSocket not open (state: ${twilioWs.readyState})`);
+        }
+      }
+      break;
+
+    case 'response.audio_transcript.delta':
+      // AI's response transcript (partial)
+      if (event.delta) {
+        console.log(`🤖 AI speaking (partial): ${event.delta}`);
+      }
+      break;
+
+    case 'response.audio_transcript.done':
+      // AI's complete response transcript
+      if (event.transcript) {
+        console.log(`🤖 AI spoke: "${event.transcript}"`);
+        void storeTranscript(callSid, 'dispatcher', event.transcript, true);
+        
+        // Update call state
+        const state = callStateMap.get(callSid);
+        if (state) {
+          state.messages.push({
+            id: Date.now().toString(),
+            sender: 'dispatcher',
+            text: event.transcript,
+            timestamp: new Date(),
+            isPartial: false
+          });
+        }
+      }
+      break;
+
+    case 'conversation.item.input_audio_transcription.completed':
+      // Caller's speech transcript (what they said)
+      if (event.transcript) {
+        console.log(`📝 Caller said: "${event.transcript}"`);
+        void storeTranscript(callSid, 'caller', event.transcript, true);
+        
+        // Update call state and trigger analysis
+        const state = callStateMap.get(callSid);
+        if (state) {
+          state.messages.push({
+            id: Date.now().toString(),
+            sender: 'caller',
+            text: event.transcript,
+            timestamp: new Date(),
+            isPartial: false
+          });
+          
+          // Run analysis in background (doesn't block audio)
+          void analyzeAndBroadcast(callSid, state);
+        }
+      }
+      break;
+
+    case 'input_audio_buffer.speech_started':
+      console.log(`🎤 Caller started speaking (${callSid})`);
+      break;
+
+    case 'input_audio_buffer.speech_stopped':
+      console.log(`🎤 Caller stopped speaking (${callSid})`);
+      break;
+
+    case 'response.done':
+      console.log(`✅ OpenAI response complete for ${callSid}`);
+      // Log if the response had no output
+      if (event.response?.output?.length === 0) {
+        console.warn(`⚠️  Response had no output items`);
+      }
+      if (event.response?.status === 'failed') {
+        console.error(`❌ Response failed:`, event.response?.status_details);
+      }
+      break;
+
+    case 'response.output_item.added':
+      console.log(`📦 Output item added: ${event.item?.type}`);
+      break;
+
+    case 'response.content_part.added':
+      console.log(`📄 Content part added: ${event.part?.type}`);
+      break;
+
+    case 'conversation.item.input_audio_transcription.failed':
+      // Log the actual error for transcription failures
+      console.error(`❌ Transcription failed for ${callSid}:`, JSON.stringify(event.error || event, null, 2));
+      break;
+
+    case 'error':
+      console.error(`❌ OpenAI error for ${callSid}:`, JSON.stringify(event.error || event, null, 2));
+      break;
+
+    default:
+      // Log other events at debug level (but not audio deltas which are too frequent)
+      if (eventType !== 'response.audio.delta') {
+        console.log(`📨 OpenAI event (${callSid}): ${eventType}`);
+        // Log full event for debugging
+        if (eventType.includes('failed') || eventType.includes('error')) {
+          console.log(`   Full event:`, JSON.stringify(event, null, 2));
+        }
+      }
+  }
+}
+
 // WebSocket handler for Twilio Media Streams
 wss.on('connection', (ws: WSType, req) => {
   console.log('🔌 Twilio WebSocket connected from:', req.socket.remoteAddress);
-  console.log('   Path:', req.url);
-  console.log('   Headers:', JSON.stringify(req.headers, null, 2));
   
   let callSid: string | null = null;
-  let deepgramConnection: any = null;
+  let streamSid: string | null = null;
+  let openaiWs: WebSocket | null = null;
   let messageCount = 0;
   let audioPacketCount = 0;
-  let firstAudioPacketTime: number | null = null;
-  let lastAudioPacketTime: number | null = null;
 
   ws.on('message', async (message: Buffer) => {
     messageCount++;
     
     try {
       const msg: TwilioMessage = JSON.parse(message.toString());
-      
 
       switch (msg.event) {
         case 'start':
           callSid = msg.start.callSid;
+          streamSid = msg.start.streamSid;
           console.log(`🚨 Call started: ${callSid}`);
-          console.log(`   Stream SID: ${msg.start.streamSid}`);
+          console.log(`   Stream SID: ${streamSid}`);
           console.log(`   Media format: ${msg.start.mediaFormat.encoding} @ ${msg.start.mediaFormat.sampleRate}Hz`);
-          console.log(`   Track config: ${msg.start.tracks?.join(', ') || 'inbound_track (default)'}`);
-
-          // For demo purposes, ALWAYS use single-channel (caller only)
-          // Even if Twilio sends both tracks, we'll ignore the dispatcher track
-          // This gives us real-time performance since we only process 1 audio stream
-          const isTwoWay = false; // Force single-channel for performance
-          console.log(`   Mode: SINGLE-CHANNEL (caller only) for real-time performance`);
-          console.log(`   ⚠️  Multichannel disabled to prevent lag`);
 
           // Create call record in Supabase
-          await createCallRecord(callSid, msg.start.streamSid);
+          await createCallRecord(callSid, streamSid);
 
-          // Track session and initial state
-          const tracks = (msg.start.tracks || ['inbound']).map((t: string) => t.toLowerCase());
-          // With <Connect><Stream>, we can ALWAYS send audio back (bidirectional by design)
-          // The tracks array just shows what Twilio is sending TO us, not what we can send back
-          // Force canSpeak=true since we're using <Connect> not <Start>
-          const canSpeak = true;
-          console.log(`   🔊 Bidirectional mode: tracks=[${tracks.join(', ')}], canSpeak=${canSpeak} (forced for <Connect>)`);
-          callSessionMap.set(callSid, { ws, streamSid: msg.start.streamSid, canSpeak });
+          // Initialize call state
           callStateMap.set(callSid, {
             messages: [],
             incident: {
@@ -444,49 +662,32 @@ wss.on('connection', (ws: WSType, req) => {
             nextQuestion: null,
           });
 
-          // Initialize Deepgram connection with correct channel configuration
-          deepgramConnection = await initDeepgramConnection(callSid, isTwoWay);
-          activeConnections.set(callSid, deepgramConnection);
-          
-          // Send initial greeting via TTS (since we're using bidirectional stream without <Say>)
-          // Small delay to ensure WebSocket is fully established
-          const currentCallSid = callSid; // Capture for closure
-          setTimeout(() => {
-            const session = callSessionMap.get(currentCallSid);
-            if (session?.canSpeak) {
-              console.log('🎙️ Sending initial greeting via TTS');
-              void startAuraTts(currentCallSid, '911, what is your emergency? Please describe the situation.');
-            }
-          }, 500);
+          // Connect to OpenAI Realtime API
+          openaiWs = connectToOpenAI(callSid, streamSid, ws);
+          callSessionMap.set(callSid, {
+            twilioWs: ws,
+            openaiWs: openaiWs,
+            streamSid: streamSid,
+            callSid: callSid
+          });
           break;
 
         case 'media':
-          // Forward only inbound/caller audio to Deepgram
-          if (deepgramConnection && msg.media.payload) {
-            const track = (msg.media as any).track?.toLowerCase?.() || 'inbound';
-            if (track !== 'inbound' && track !== 'inbound_track') {
-              // Ignore outbound/media we generate ourselves or TwiML <Say>
-              break;
-            }
-
+          // Forward audio to OpenAI
+          if (openaiWs && openaiWs.readyState === WebSocket.OPEN && msg.media.payload) {
             audioPacketCount++;
-            const now = Date.now();
             
-            if (!firstAudioPacketTime) {
-              firstAudioPacketTime = now;
-              console.log(`🎵 First audio packet received`);
-            }
-            lastAudioPacketTime = now;
-            
-            // Log every 100 packets to track throughput
+            // Log every 100 packets
             if (audioPacketCount % 100 === 0) {
-              const elapsed = (now - firstAudioPacketTime) / 1000;
-              const packetsPerSec = audioPacketCount / elapsed;
-              console.log(`🎵 Audio packets: ${audioPacketCount} (${packetsPerSec.toFixed(1)}/sec)`);
+              console.log(`🎵 Audio packets forwarded to OpenAI: ${audioPacketCount}`);
             }
             
-            const audioBuffer = Buffer.from(msg.media.payload, 'base64');
-            deepgramConnection.send(audioBuffer);
+            // Send audio to OpenAI (already base64 encoded mulaw from Twilio)
+            const audioAppend = {
+              type: 'input_audio_buffer.append',
+              audio: msg.media.payload
+            };
+            openaiWs.send(JSON.stringify(audioAppend));
           }
           break;
 
@@ -503,27 +704,14 @@ wss.on('connection', (ws: WSType, req) => {
             timestamp: new Date().toISOString()
           });
           
-          // Clean up Deepgram connection
-          if (deepgramConnection) {
-            deepgramConnection.finish();
-            if (callSid) {
-              activeConnections.delete(callSid);
-            }
-          }
-          
-          // Clean up TTS/session
+          // Clean up OpenAI connection
           const session = callSessionMap.get(msg.stop.callSid);
-          if (session?.tts) {
-            try {
-              if ((session.tts as any).readyState === WebSocket.OPEN) {
-                (session.tts as any).close();
-              }
-            } catch {}
-            session.tts = undefined as any;
+          if (session?.openaiWs) {
+            session.openaiWs.close();
           }
           callSessionMap.delete(msg.stop.callSid);
 
-          // Generate final report (best-effort) then drop state
+          // Generate final report
           const finalState = callStateMap.get(msg.stop.callSid);
           if (finalState) {
             void generateReport(msg.stop.callSid, finalState);
@@ -532,7 +720,7 @@ wss.on('connection', (ws: WSType, req) => {
           break;
 
         default:
-          console.log('📨 Unknown Twilio event:', msg);
+          console.log('📨 Unknown Twilio event:', (msg as any).event);
       }
     } catch (error) {
       console.error('❌ Error processing Twilio message:', error);
@@ -542,22 +730,11 @@ wss.on('connection', (ws: WSType, req) => {
   ws.on('close', () => {
     console.log('🔌 Twilio WebSocket disconnected');
     
-    // Clean up if connection closes unexpectedly
-    if (deepgramConnection) {
-      deepgramConnection.finish();
-      if (callSid) {
-        activeConnections.delete(callSid);
-      }
-    }
+    // Clean up OpenAI connection
     if (callSid) {
       const session = callSessionMap.get(callSid);
-      if (session?.tts) {
-        try {
-          if ((session.tts as any).readyState === WebSocket.OPEN) {
-            (session.tts as any).close();
-          }
-        } catch {}
-        session.tts = undefined as any;
+      if (session?.openaiWs) {
+        session.openaiWs.close();
       }
       callSessionMap.delete(callSid);
     }
@@ -567,270 +744,22 @@ wss.on('connection', (ws: WSType, req) => {
     console.error('❌ Twilio WebSocket error:', error);
     
     // Clean up on error
-    if (deepgramConnection) {
-      deepgramConnection.finish();
-      if (callSid) {
-        activeConnections.delete(callSid);
-      }
-    }
     if (callSid) {
       const session = callSessionMap.get(callSid);
-      if (session?.tts) {
-        try {
-          if ((session.tts as any).readyState === WebSocket.OPEN) {
-            (session.tts as any).close();
-          }
-        } catch {}
-        session.tts = undefined as any;
+      if (session?.openaiWs) {
+        session.openaiWs.close();
       }
       callSessionMap.delete(callSid);
     }
   });
 });
 
-// Initialize Deepgram live transcription for a call
-async function initDeepgramConnection(callSid: string, isTwoWay: boolean = false) {
-  console.log(`🎤 Initializing Deepgram for call: ${callSid}`);
-  console.log(`   Configuration: Mono (1 channel - caller only)`);
-
-  const deepgram = createClient(DEEPGRAM_API_KEY);
-
-  // Always use single-channel with optimal settings for real-time performance
-  const deepgramConfig: any = {
-    encoding: 'mulaw',
-    sample_rate: 8000,
-    channels: 1,  // Single channel = caller only
-    punctuate: false,  // Disable for speed (we don't need perfect punctuation)
-    interim_results: true,  // Enable interim for live feel
-    smart_format: false,  // Disable for speed
-    model: 'nova-2-phonecall',  // Optimized for phone audio
-    endpointing: 200,  // Very aggressive (200ms silence = end of utterance)
-    utterance_end_ms: 300,  // Force utterance end after 1s silence
-  };
-
-  // No multichannel needed - we only process caller audio
-  const connection = deepgram.listen.live(deepgramConfig);
-
-  // Keepalive for Deepgram connection
-  const keepAliveInterval = setInterval(() => {
-    if (connection.getReadyState() === 1) { // OPEN
-      connection.keepAlive();
-    }
-  }, 3000);
-
-  // Handle transcript events
-  connection.on(LiveTranscriptionEvents.Open, () => {
-    console.log(`✅ Deepgram connection opened for call: ${callSid}`);
-  });
-
-  // Track metadata for debugging
-  connection.on(LiveTranscriptionEvents.Metadata, (data: any) => {
-    console.log(`📊 Deepgram metadata for ${callSid}:`, {
-      request_id: data.request_id,
-      model_info: data.model_info,
-      channels: data.channels
-    });
-  });
-
-  connection.on(LiveTranscriptionEvents.Transcript, async (data: any) => {
-    const receiveTime = Date.now();
-    const transcript = data.channel?.alternatives?.[0]?.transcript;
-    const isFinal = data.is_final;
-    const confidence = data.channel?.alternatives?.[0]?.confidence;
-    const duration = data.duration; // Audio duration from Deepgram
-    const start = data.start; // Start time in audio stream
-    
-    // Skip if no transcript
-    if (!transcript) {
-      return;
-    }
-    
-    // Always caller since we're in single-channel mode
-    const sender: 'caller' | 'dispatcher' = 'caller';
-
-    if (isFinal) {
-      console.log(`\n📝 [FINAL] ${sender.toUpperCase()}: "${transcript}"`);
-      console.log(`   Confidence: ${confidence}`);
-      console.log(`   ⏱️  Audio duration: ${duration}s, Audio start: ${start}s`);
-      
-      const storeStartTime = Date.now();
-      // Store final transcript
-      await storeTranscript(callSid, sender, transcript, true, confidence);
-      const storeEndTime = Date.now();
-      
-      console.log(`   ⏱️  Storage latency: ${storeEndTime - storeStartTime}ms`);
-      console.log(`   ⏱️  Total processing time: ${storeEndTime - receiveTime}ms`);
-
-      // Track and analyze latest transcript
-      const state = callStateMap.get(callSid);
-      if (state) {
-        const msgObj: TranscriptMessage = {
-          id: Date.now().toString(),
-          sender,
-          text: transcript,
-          timestamp: new Date(),
-          isPartial: false,
-        };
-        state.messages.push(msgObj);
-        void analyzeAndBroadcast(callSid, state);
-      }
-    } else {
-      // Partial transcript: use for barge-in detection while TTS is speaking
-      const session = callSessionMap.get(callSid);
-      if (session?.speaking && session.streamSid) {
-        console.log('🛑 Barge-in detected from caller speech. Clearing TTS playback.');
-        try { sendTwilioClear(session.ws, session.streamSid); } catch (e) { console.error('❌ Failed to send clear during barge-in:', e); }
-        session.speaking = false;
-        if (session.tts && (session.tts as any)?.abort) {
-          try { (session.tts as any).abort(); } catch {}
-          session.tts = undefined as any;
-        }
-      }
-    }
-  });
-
-  connection.on(LiveTranscriptionEvents.Error, (error: any) => {
-    console.error(`❌ Deepgram error for call ${callSid}:`, error);
-  });
-
-  connection.on(LiveTranscriptionEvents.Close, () => {
-    console.log(`🔌 Deepgram connection closed for call: ${callSid}`);
-    clearInterval(keepAliveInterval);
-  });
-
-  return connection;
-}
-
-// --- LLM + TTS helpers ---
-
-function sendTwilioMedia(session: { ws: WSType; streamSid: string }, payloadBase64: string) {
-  // Check WebSocket state before sending
-  const wsState = session.ws.readyState;
-  if (wsState !== 1) { // 1 = OPEN
-    console.error(`❌ Cannot send media: WebSocket not open (state: ${wsState})`);
-    return;
-  }
-  
-  // Twilio expects media messages with an incrementing chunk and timestamp
-  const chunk = ((session as any).outSeq ?? 0) + 1;
-  (session as any).outSeq = chunk;
-  const timestamp = Date.now().toString();
-  const message: any = {
-    event: 'media',
-    streamSid: session.streamSid,
-    media: {
-      payload: payloadBase64,
-    },
-  };
-  try {
-    session.ws.send(JSON.stringify(message));
-    if (chunk === 1) {
-      console.log('📤 Sent first outbound audio chunk to Twilio');
-      console.log(`   StreamSid: ${session.streamSid}`);
-      console.log(`   Payload size: ${payloadBase64.length} chars`);
-    } else if (chunk % 50 === 0) {
-      console.log(`📤 Outbound audio chunks sent: ${chunk}`);
-    }
-  } catch (error) {
-    console.error('❌ Failed to send media to Twilio:', error);
-  }
-}
-
-function sendTwilioClear(ws: WSType, streamSid: string) {
-  try {
-    ws.send(JSON.stringify({ event: 'clear', streamSid }));
-  } catch (error) {
-    console.error('❌ Failed to send clear to Twilio:', error);
-  }
-}
-
-async function startAuraTts(callSid: string, text: string) {
-  const ttsStart = Date.now();
-  console.log(`🚀 Starting Aura TTS for ${callSid} with text: "${text}"`);
-  const session = callSessionMap.get(callSid);
-  if (!session) {
-    console.error(`❌ No session found for ${callSid} in startAuraTts`);
-    return;
-  }
-
-  // Abort any existing TTS stream for this call
-  if (session.tts && (session.tts as any)?.abort) {
-    try { (session.tts as any).abort(); } catch {}
-    session.tts = undefined as any;
-  }
-
-  const controller = new AbortController();
-  session.tts = controller as any;
-  session.speaking = true;
-
-  const ttsUrl = `https://api.deepgram.com/v1/speak?model=${encodeURIComponent(AURA_VOICE)}&encoding=mulaw&sample_rate=8000`;
-  try {
-    const resp = await fetch(ttsUrl, {
-      method: 'POST',
-      headers: {
-        Authorization: `Token ${DEEPGRAM_API_KEY}`,
-        'Content-Type': 'application/json',
-        Accept: 'audio/mulaw',
-      },
-      body: JSON.stringify({ text }),
-      signal: controller.signal,
-    } as any);
-
-    if (!resp.ok || !resp.body) {
-      console.error(`❌ Aura TTS HTTP error: ${resp.status} ${resp.statusText}`);
-      session.speaking = false;
-      session.tts = undefined as any;
-      return;
-    }
-
-    console.log(`🔊 TTS HTTP stream started (${Date.now() - ttsStart}ms to connect)`);
-    let loggedOnce = false;
-    const reader: any = (resp.body as any).getReader ? (resp.body as any).getReader() : null;
-
-    if (reader) {
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        if (!value) continue;
-        const buffer = Buffer.isBuffer(value) ? value : Buffer.from(value);
-        const payload = buffer.toString('base64');
-        sendTwilioMedia(session, payload);
-        if (!loggedOnce) {
-          console.log(`🎵 First TTS audio chunk sent (${Date.now() - ttsStart}ms from request)`);
-          loggedOnce = true;
-        }
-      }
-    } else {
-      // Node 18+ web streams are async iterable
-      for await (const chunk of resp.body as any) {
-        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-        const payload = buffer.toString('base64');
-        sendTwilioMedia(session, payload);
-        if (!loggedOnce) {
-          console.log(`🎵 First TTS audio chunk sent (${Date.now() - ttsStart}ms from request)`);
-          loggedOnce = true;
-        }
-      }
-    }
-  } catch (error) {
-    if ((error as any).name === 'AbortError') {
-      console.log('🛑 TTS HTTP stream aborted');
-    } else {
-      console.error('❌ Aura TTS HTTP error:', error);
-    }
-  } finally {
-    const s = callSessionMap.get(callSid);
-    if (s) {
-      s.speaking = false;
-      s.tts = undefined as any;
-    }
-  }
-}
-
 // Call Gemini analysis via Next API and broadcast updates
+// This runs in background - doesn't block the voice conversation!
 async function analyzeAndBroadcast(callSid: string, state: CallState) {
   const analysisStart = Date.now();
-  console.log(`🔍 Starting analysis for ${callSid}...`);
+  console.log(`🔍 Starting background analysis for ${callSid}...`);
+  
   try {
     const response = await fetch('http://localhost:3000/api/analyze', {
       method: 'POST',
@@ -839,15 +768,18 @@ async function analyzeAndBroadcast(callSid: string, state: CallState) {
         messages: state.messages,
         incident: state.incident,
         urgency: state.urgency,
+        callSid: callSid
       }),
     });
+    
     if (!response.ok) {
       console.error(`❌ Analysis HTTP error ${response.status}`);
       return;
     }
+    
     const data = await response.json();
     const analysisTime = Date.now() - analysisStart;
-    console.log(`🧠 Analysis complete (${analysisTime}ms) for ${callSid}:`, JSON.stringify(data, null, 2));
+    console.log(`🧠 Analysis complete (${analysisTime}ms) for ${callSid}`);
 
     const { updates, nextQuestion } = data;
     if (updates) {
@@ -856,24 +788,10 @@ async function analyzeAndBroadcast(callSid: string, state: CallState) {
       state.incident = { ...state.incident, ...fields };
     }
     if (nextQuestion !== undefined) {
-      const prev = state.nextQuestion;
       state.nextQuestion = nextQuestion;
-      
-      console.log(`🤔 Question check: Prev="${prev}", New="${nextQuestion}"`);
-      
-      if (nextQuestion && nextQuestion !== prev) {
-        const session = callSessionMap.get(callSid);
-        if (session?.streamSid && session?.canSpeak) {
-          console.log(`🤖 AI decided to speak: "${nextQuestion}"`);
-          void startAuraTts(callSid, nextQuestion);
-        } else {
-          console.warn(`⚠️ Cannot speak: Media stream is inbound-only; skipping TTS for ${callSid}`);
-        }
-      } else {
-          console.log('🤐 AI decided NOT to speak (question same or empty)');
-      }
     }
 
+    // Broadcast analysis results to dashboard
     broadcastToDashboard({
       type: 'analysis',
       call_sid: callSid,
@@ -921,12 +839,14 @@ async function generateReport(callSid: string, state: CallState) {
 
 // Start server
 httpServer.listen(Number(PORT), '0.0.0.0', () => {
-  console.log('\n🚨 DispatchIQ Server');
-  console.log('================================');
+  console.log('\n🚨 SignalOne Server (OpenAI Realtime API)');
+  console.log('==========================================');
   console.log(`✅ HTTP Server: http://localhost:${PORT}`);
   console.log(`✅ WebSocket: ws://localhost:${PORT}/twilio/media`);
+  console.log(`✅ Dashboard: ws://localhost:${PORT}/dashboard`);
   console.log(`✅ Health check: http://localhost:${PORT}/health`);
   console.log('\n📞 Twilio webhook URL: POST http://localhost:${PORT}/twilio/voice');
+  console.log(`🎙️  Voice: ${VOICE}`);
   console.log('🔌 Active connections: 0\n');
 });
 
@@ -934,12 +854,12 @@ httpServer.listen(Number(PORT), '0.0.0.0', () => {
 process.on('SIGTERM', () => {
   console.log('🛑 SIGTERM received, closing server...');
   
-  // Close all Deepgram connections
-  activeConnections.forEach((connection, callSid) => {
-    console.log(`Closing Deepgram connection for call: ${callSid}`);
-    connection.finish();
+  // Close all OpenAI connections
+  callSessionMap.forEach((session, callSid) => {
+    console.log(`Closing OpenAI connection for call: ${callSid}`);
+    session.openaiWs.close();
   });
-  activeConnections.clear();
+  callSessionMap.clear();
 
   httpServer.close(() => {
     console.log('✅ Server closed');
