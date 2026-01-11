@@ -253,9 +253,9 @@ async function osrmEta(
   lonA: number,
   latB: number,
   lonB: number,
-): Promise<number | null> {
+): Promise<{ duration: number; geometry: string } | null> {
   const key = `route:${lonA.toFixed(5)},${latA.toFixed(5)}:${lonB.toFixed(5)},${latB.toFixed(5)}`;
-  const cached = getCache<number>(key);
+  const cached = getCache<{ duration: number; geometry: string }>(key);
   if (cached !== null && cached !== undefined) return cached;
   if (circuitOpen('osrm')) return null;
   if (inflight.has(key)) return inflight.get(key)!;
@@ -263,7 +263,7 @@ async function osrmEta(
   const task = (async () => {
     await rateLimit('osrm');
     try {
-      const url = `https://router.project-osrm.org/route/v1/driving/${lonA},${latA};${lonB},${latB}?overview=false&alternatives=false&annotations=false&steps=false`;
+      const url = `https://router.project-osrm.org/route/v1/driving/${lonA},${latA};${lonB},${latB}?overview=full&geometries=geojson&alternatives=false&annotations=false&steps=false`;
       const res = await fetchWithTimeout(url, { headers: { 'User-Agent': USER_AGENT } }, 5000);
       if (!res.ok) {
         recordFailure('osrm');
@@ -271,9 +271,11 @@ async function osrmEta(
       }
       const data = await res.json();
       const duration = data?.routes?.[0]?.duration;
-      if (typeof duration === 'number') {
-        setCache(key, duration, 45 * 60 * 1000);
-        return duration;
+      const geometry = data?.routes?.[0]?.geometry;
+      if (typeof duration === 'number' && geometry) {
+        const result = { duration, geometry: JSON.stringify(geometry) };
+        setCache(key, result, 45 * 60 * 1000);
+        return result;
       }
       return null;
     } finally {
@@ -308,48 +310,73 @@ function fallbackDurationSeconds(latA: number, lonA: number, latB: number, lonB:
 export const dynamic = 'force-dynamic';
 
 export async function GET(req: Request) {
-  const { searchParams } = new URL(req.url);
-  const address = searchParams.get('address');
-  if (!address) {
-    return NextResponse.json({ error: 'address required' }, { status: 400 });
-  }
+  try {
+    const { searchParams } = new URL(req.url);
+    const address = searchParams.get('address');
+    const latParam = searchParams.get('lat');
+    const lonParam = searchParams.get('lon');
 
-  // Geocode
-  const coords = await nominatim(address);
-  if (!coords) {
-    return NextResponse.json({ error: 'Unable to geocode address' }, { status: 502 });
-  }
+    let coords: GeoResult | null = null;
+    if (latParam && lonParam) {
+      const lat = parseFloat(latParam);
+      const lon = parseFloat(lonParam);
+      if (Number.isFinite(lat) && Number.isFinite(lon)) {
+        coords = { lat, lon };
+      }
+    }
 
-  // Find stations: try 10km then 25km
-  let stations = await overpassPolice(coords.lat, coords.lon, 10000);
-  if (!stations.length) {
-    stations = await overpassPolice(coords.lat, coords.lon, 25000);
-  }
-  if (!stations.length) {
+    if (!coords && !address) {
+      return NextResponse.json({ error: 'address or lat/lon required' }, { status: 400 });
+    }
+
+    // Geocode if necessary
+    if (!coords && address) {
+      coords = await nominatim(address);
+    }
+    if (!coords) {
+      return NextResponse.json({ error: 'Unable to geocode address' }, { status: 502 });
+    }
+
+    // Find stations: try 10km then 25km
+    let stations = await overpassPolice(coords.lat, coords.lon, 10000);
+    if (!stations.length) {
+      stations = await overpassPolice(coords.lat, coords.lon, 25000);
+    }
+    if (!stations.length) {
+      return NextResponse.json(
+        { lat: coords.lat, lon: coords.lon, etaMinutes: null, note: 'No nearby stations found' },
+        { status: 200 },
+      );
+    }
+
+    // Route top 3
+    const top = stations.slice(0, 3);
+    let bestEta: number | null = null;
+    let bestStation: Station | null = null;
+    let bestGeometry: string | null = null;
+    for (const station of top) {
+      const result = await osrmEta(coords.lat, coords.lon, station.lat, station.lon);
+      const useDur = result?.duration ?? fallbackDurationSeconds(coords.lat, coords.lon, station.lat, station.lon);
+      if (bestEta === null || useDur < bestEta) {
+        bestEta = useDur;
+        bestStation = station;
+        bestGeometry = result?.geometry ?? null;
+      }
+    }
+
+    const etaMinutes = bestEta ? Math.round(bestEta / 60) : null;
+    return NextResponse.json({
+      lat: coords.lat,
+      lon: coords.lon,
+      station: bestStation,
+      etaMinutes,
+      routeGeometry: bestGeometry,
+    });
+  } catch (error) {
+    console.error('[police-eta] Error:', error);
     return NextResponse.json(
-      { lat: coords.lat, lon: coords.lon, etaMinutes: null, note: 'No nearby stations found' },
-      { status: 200 },
+      { error: 'Internal server error', details: String(error) },
+      { status: 500 }
     );
   }
-
-  // Route top 3
-  const top = stations.slice(0, 3);
-  let bestEta: number | null = null;
-  let bestStation: Station | null = null;
-  for (const station of top) {
-    const dur = await osrmEta(coords.lat, coords.lon, station.lat, station.lon);
-    const useDur = dur ?? fallbackDurationSeconds(coords.lat, coords.lon, station.lat, station.lon);
-    if (bestEta === null || useDur < bestEta) {
-      bestEta = useDur;
-      bestStation = station;
-    }
-  }
-
-  const etaMinutes = bestEta ? Math.round(bestEta / 60) : null;
-  return NextResponse.json({
-    lat: coords.lat,
-    lon: coords.lon,
-    station: bestStation,
-    etaMinutes,
-  });
 }

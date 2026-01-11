@@ -70,8 +70,13 @@ const wss = new WebSocketServer({
   noServer: true  // We'll handle the upgrade manually
 });
 
-// Create WebSocket server for Dashboard clients
+// Create WebSocket server for Dashboard clients (human dispatcher)
 const dashboardWss = new WebSocketServer({ 
+  noServer: true
+});
+
+// Create WebSocket server for AI Monitor clients
+const aiMonitorWss = new WebSocketServer({ 
   noServer: true
 });
 
@@ -89,16 +94,23 @@ httpServer.on('upgrade', (request, socket, head) => {
     dashboardWss.handleUpgrade(request, socket, head, (ws) => {
       dashboardWss.emit('connection', ws, request);
     });
+  } else if (pathname === '/ai-monitor') {
+    aiMonitorWss.handleUpgrade(request, socket, head, (ws) => {
+      aiMonitorWss.emit('connection', ws, request);
+    });
   } else {
     console.log(`❌ Unknown WebSocket path: ${pathname}`);
     socket.destroy();
   }
 });
 
-// Store connected dashboard clients
+// Store connected dashboard clients (human dispatcher)
 const dashboardClients = new Set<WSType>();
 
-// Handle dashboard WebSocket connections
+// Store connected AI monitor clients
+const aiMonitorClients = new Set<WSType>();
+
+// Handle dashboard WebSocket connections (human dispatcher)
 dashboardWss.on('connection', (ws: WSType) => {
   console.log(`📱 Dashboard client connected (total: ${dashboardClients.size + 1})`);
   dashboardClients.add(ws);
@@ -114,7 +126,31 @@ dashboardWss.on('connection', (ws: WSType) => {
   });
 });
 
-// Helper: Broadcast transcript to all dashboard clients
+// Handle AI monitor WebSocket connections
+aiMonitorWss.on('connection', (ws: WSType) => {
+  console.log(`🖥️  AI Monitor client connected (total: ${aiMonitorClients.size + 1})`);
+  aiMonitorClients.add(ws);
+
+  // Send current AI mode status
+  ws.send(JSON.stringify({ type: 'ai_mode_status', aiModeEnabled }));
+
+  // Send all active AI calls
+  aiCallsMap.forEach((call) => {
+    ws.send(JSON.stringify({ type: 'ai_call_update', call }));
+  });
+
+  ws.on('close', () => {
+    console.log(`🖥️  AI Monitor client disconnected (remaining: ${aiMonitorClients.size - 1})`);
+    aiMonitorClients.delete(ws);
+  });
+
+  ws.on('error', (error) => {
+    console.error('❌ AI Monitor WebSocket error:', error);
+    aiMonitorClients.delete(ws);
+  });
+});
+
+// Helper: Broadcast to all human dispatcher dashboard clients
 function broadcastToDashboard(data: any) {
   const startTime = Date.now();
   const message = JSON.stringify(data);
@@ -137,7 +173,43 @@ function broadcastToDashboard(data: any) {
   
   const elapsed = Date.now() - startTime;
   if (successCount > 0 || failCount > 0) {
-    console.log(`📡 Broadcast: ${successCount} sent, ${failCount} failed (${elapsed}ms)`);
+    console.log(`📡 Dashboard broadcast: ${successCount} sent, ${failCount} failed (${elapsed}ms)`);
+  }
+}
+
+// Helper: Broadcast to all AI monitor clients
+function broadcastToAiMonitor(data: any) {
+  const startTime = Date.now();
+  const message = JSON.stringify(data);
+  let successCount = 0;
+  let failCount = 0;
+  
+  aiMonitorClients.forEach((client) => {
+    if (client.readyState === 1) { // 1 = OPEN
+      try {
+        client.send(message);
+        successCount++;
+      } catch (error) {
+        console.error('❌ Failed to send to AI monitor client:', error);
+        failCount++;
+      }
+    } else {
+      failCount++;
+    }
+  });
+  
+  const elapsed = Date.now() - startTime;
+  if (successCount > 0 || failCount > 0) {
+    console.log(`🖥️  AI Monitor broadcast: ${successCount} sent, ${failCount} failed (${elapsed}ms)`);
+  }
+}
+
+// Helper: Update and broadcast AI call to monitor
+function updateAiCall(callSid: string, updates: Partial<AIMonitorCall>) {
+  const existingCall = aiCallsMap.get(callSid);
+  if (existingCall) {
+    Object.assign(existingCall, updates);
+    broadcastToAiMonitor({ type: 'ai_call_update', call: existingCall });
   }
 }
 
@@ -241,8 +313,11 @@ interface CallState {
   incident: IncidentDetails;
   urgency: Urgency;
   nextQuestion: string | null;
+  isAiMode: boolean;  // Track if this call is in AI mode (routed to AI monitor)
 }
 const callStateMap = new Map<string, CallState>();
+// Track last geocoded address per call to avoid duplicate lookups
+const lastGeocodedAddress = new Map<string, string>();
 
 // Store active OpenAI connections per call
 interface CallSession {
@@ -250,8 +325,23 @@ interface CallSession {
   openaiWs: WebSocket;
   streamSid: string;
   callSid: string;
+  isAiMode: boolean;  // Track if this call is in AI mode
 }
 const callSessionMap = new Map<string, CallSession>();
+
+// Store active real AI calls for the AI monitor (real Twilio calls when AI mode is ON)
+interface AIMonitorCall {
+  callSid: string;
+  scenario: string;
+  status: 'active' | 'completed' | 'pending_action';
+  urgency: Urgency;
+  incident: IncidentDetails;
+  messages: TranscriptMessage[];
+  actions: AICallAction[];
+  startedAt: Date;
+  isRealCall: boolean;  // True for real Twilio calls, false for simulations
+}
+const aiCallsMap = new Map<string, AIMonitorCall>();
 
 // System prompt for the 911 dispatcher AI
 const SYSTEM_INSTRUCTIONS = `You are a calm, professional 911 emergency dispatcher AI assistant. Your job is to help gather critical information from callers in distress.
@@ -309,7 +399,7 @@ async function createCallRecord(callSid: string, streamSid: string) {
   }
 }
 
-// Helper: Store transcript in Supabase
+// Helper: Store transcript in Supabase and broadcast to appropriate dashboard
 async function storeTranscript(
   callSid: string,
   sender: 'caller' | 'dispatcher',
@@ -319,9 +409,13 @@ async function storeTranscript(
 ) {
   const broadcastStartTime = Date.now();
   
-  // Always broadcast to dashboard clients immediately
+  // Check if this call is in AI mode
+  const callState = callStateMap.get(callSid);
+  const isAiMode = callState?.isAiMode ?? false;
+  
+  // Prepare transcript data
   const transcriptData = {
-    type: 'transcript',
+    type: isAiMode ? 'ai_transcript' : 'transcript',
     id: Date.now().toString() + Math.random(),
     call_sid: callSid,
     sender,
@@ -332,7 +426,28 @@ async function storeTranscript(
     timestamp: new Date().toISOString()
   };
   
-  broadcastToDashboard(transcriptData);
+  // Route to appropriate dashboard based on AI mode
+  if (isAiMode) {
+    // Update AI monitor call with new message
+    const aiCall = aiCallsMap.get(callSid);
+    if (aiCall && isFinal) {
+      const newMessage: TranscriptMessage = {
+        id: transcriptData.id,
+        sender,
+        text,
+        timestamp: new Date(),
+        isPartial: false,
+      };
+      aiCall.messages.push(newMessage);
+      
+      // Broadcast update to AI monitor
+      broadcastToAiMonitor({ type: 'ai_call_update', call: aiCall });
+    }
+  } else {
+    // Broadcast to human dispatcher dashboard
+    broadcastToDashboard(transcriptData);
+  }
+  
   const broadcastElapsed = Date.now() - broadcastStartTime;
 
   // Also store in Supabase if configured
@@ -490,16 +605,16 @@ async function runAISimulation(scenario: {
     scenario: scenario.name,
     personality: scenario.personality,
     context: scenario.context,
-    messages: [],
-    incident: {
-      location: null,
-      type: null,
-      injuries: null,
-      threatLevel: null,
-      peopleCount: null,
-      callerRole: null,
-    },
-    urgency: 'Low',
+            messages: [],
+            incident: {
+              location: null,
+              type: null,
+              injuries: null,
+              threatLevel: null,
+              peopleCount: null,
+              callerRole: null,
+            },
+            urgency: 'Low',
     actions: [],
     status: 'active',
     startedAt: new Date(),
@@ -552,9 +667,9 @@ async function runAISimulation(scenario: {
     if (!callerResponse || callerResponse.toLowerCase().includes('end call') || callerResponse.toLowerCase().includes('thank you')) {
       // Caller ending call
       addMessageToSimCall(simCall, 'caller', callerResponse || "Okay, thank you.");
-      break;
-    }
-    
+              break;
+            }
+
     addMessageToSimCall(simCall, 'caller', callerResponse);
     conversationHistory.push({ role: 'caller', content: callerResponse });
     
@@ -583,7 +698,7 @@ function addMessageToSimCall(simCall: AISimulationCall, sender: 'caller' | 'disp
   simCall.messages.push(message);
   
   // Broadcast transcript
-  broadcastToDashboard({
+          broadcastToDashboard({
     type: 'ai_transcript',
     id: message.id,
     call_sid: simCall.callSid,
@@ -677,7 +792,7 @@ ${turnCount > 6 ? 'This is the end of the call - thank them and hang up.' : ''}`
     
     const data = await response.json();
     return data.choices?.[0]?.message?.content || null;
-  } catch (error) {
+    } catch (error) {
     console.error('Error generating caller response:', error);
     return null;
   }
@@ -799,6 +914,40 @@ app.all('/twilio/voice', (req, res) => {
   console.log('✅ TwiML response sent with WebSocket URL:', websocketUrl);
 });
 
+// Optional: Receive precise device geolocation from a mobile app and broadcast to dashboard
+// POST /twilio/location { callSid, lat, lon, address? }
+app.post('/twilio/location', express.json(), (req, res) => {
+  try {
+    const { callSid, lat, lon, address } = req.body || {};
+    if (!callSid || typeof lat !== 'number' || typeof lon !== 'number') {
+      return res.status(400).json({ error: 'callSid, lat, lon are required' });
+    }
+
+    console.log(`📍 Location update for ${callSid}:`, { lat, lon, address });
+
+    // Update incident state if present
+    const state = callStateMap.get(callSid);
+    if (state && address) {
+      state.incident.location = address;
+    }
+
+    // Broadcast to dashboard clients
+    broadcastToDashboard({
+      type: 'geo',
+      call_sid: callSid,
+      lat,
+      lon,
+      address: address || null,
+      timestamp: new Date().toISOString(),
+    });
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('❌ Error handling /twilio/location', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
 // Connect to OpenAI Realtime API
 function connectToOpenAI(callSid: string, streamSid: string, twilioWs: WSType): WebSocket {
   console.log(`🔌 Connecting to OpenAI Realtime API for call: ${callSid}`);
@@ -916,9 +1065,9 @@ function handleOpenAIEvent(callSid: string, streamSid: string, twilioWs: WSType,
         }
 
         const audioMessage = {
-          event: 'media',
+    event: 'media',
           streamSid: streamSid,
-          media: {
+    media: {
             payload: event.delta // Already base64 encoded g711_ulaw
           }
         };
@@ -1049,14 +1198,19 @@ wss.on('connection', (ws: WSType, req) => {
         case 'start':
           callSid = msg.start.callSid;
           streamSid = msg.start.streamSid;
+          
+          // Check if AI mode is enabled for this call
+          const isThisCallAiMode = aiModeEnabled;
+          
           console.log(`🚨 Call started: ${callSid}`);
           console.log(`   Stream SID: ${streamSid}`);
           console.log(`   Media format: ${msg.start.mediaFormat.encoding} @ ${msg.start.mediaFormat.sampleRate}Hz`);
+          console.log(`   AI Mode: ${isThisCallAiMode ? 'ON (routing to AI Monitor)' : 'OFF (routing to Human Dispatcher)'}`);
 
           // Create call record in Supabase
           await createCallRecord(callSid, streamSid);
 
-          // Initialize call state
+          // Initialize call state with AI mode flag
           callStateMap.set(callSid, {
             messages: [],
             incident: {
@@ -1069,7 +1223,42 @@ wss.on('connection', (ws: WSType, req) => {
             },
             urgency: 'Low',
             nextQuestion: null,
+            isAiMode: isThisCallAiMode,
           });
+
+          // If AI mode is enabled, create an AI monitor call entry
+          if (isThisCallAiMode) {
+            const aiCall: AIMonitorCall = {
+              callSid: callSid,
+              scenario: 'Live Emergency Call',
+              status: 'active',
+              urgency: 'Low',
+              incident: {
+                location: null,
+                type: null,
+                injuries: null,
+                threatLevel: null,
+                peopleCount: null,
+                callerRole: null,
+              },
+              messages: [],
+              actions: [],
+              startedAt: new Date(),
+              isRealCall: true,
+            };
+            aiCallsMap.set(callSid, aiCall);
+            
+            // Broadcast new call to AI monitor
+            broadcastToAiMonitor({ 
+              type: 'ai_call_started', 
+              callSid: callSid,
+              scenario: 'Live Emergency Call',
+              timestamp: new Date().toISOString(),
+            });
+            broadcastToAiMonitor({ type: 'ai_call_update', call: aiCall });
+            
+            console.log(`🖥️  New AI call added to monitor: ${callSid}`);
+          }
 
           // Connect to OpenAI Realtime API
           openaiWs = connectToOpenAI(callSid, streamSid, ws);
@@ -1077,7 +1266,8 @@ wss.on('connection', (ws: WSType, req) => {
             twilioWs: ws,
             openaiWs: openaiWs,
             streamSid: streamSid,
-            callSid: callSid
+            callSid: callSid,
+            isAiMode: isThisCallAiMode,
           });
           break;
 
@@ -1103,15 +1293,35 @@ wss.on('connection', (ws: WSType, req) => {
         case 'stop':
           console.log(`🛑 Call ended: ${msg.stop.callSid}`);
           
+          // Check if this was an AI mode call
+          const endingCallState = callStateMap.get(msg.stop.callSid);
+          const wasAiModeCall = endingCallState?.isAiMode ?? false;
+          
           // End call record in Supabase
           await endCallRecord(msg.stop.callSid);
 
-          // Broadcast call ended to dashboard
-          broadcastToDashboard({
-            type: 'call_ended',
-            call_sid: msg.stop.callSid,
-            timestamp: new Date().toISOString()
-          });
+          // Broadcast call ended to appropriate dashboard
+          if (wasAiModeCall) {
+            // Update AI monitor call status
+            const aiCall = aiCallsMap.get(msg.stop.callSid);
+            if (aiCall) {
+              aiCall.status = 'completed';
+              broadcastToAiMonitor({ type: 'ai_call_update', call: aiCall });
+              broadcastToAiMonitor({
+                type: 'ai_call_ended',
+                call_sid: msg.stop.callSid,
+                timestamp: new Date().toISOString()
+              });
+            }
+            console.log(`🖥️  AI call ended: ${msg.stop.callSid}`);
+          } else {
+            // Broadcast to human dispatcher dashboard
+            broadcastToDashboard({
+              type: 'call_ended',
+              call_sid: msg.stop.callSid,
+              timestamp: new Date().toISOString()
+            });
+          }
           
           // Clean up OpenAI connection
           const session = callSessionMap.get(msg.stop.callSid);
@@ -1126,12 +1336,19 @@ wss.on('connection', (ws: WSType, req) => {
             void generateReport(msg.stop.callSid, finalState);
           }
           callStateMap.delete(msg.stop.callSid);
+          
+          // Clean up AI call map (keep for a bit for review, then remove after 5 min)
+          if (wasAiModeCall) {
+            setTimeout(() => {
+              aiCallsMap.delete(msg.stop.callSid);
+            }, 5 * 60 * 1000);
+          }
           break;
 
         default:
           console.log('📨 Unknown Twilio event:', (msg as any).event);
-      }
-    } catch (error) {
+    }
+  } catch (error) {
       console.error('❌ Error processing Twilio message:', error);
     }
   });
@@ -1200,14 +1417,69 @@ async function analyzeAndBroadcast(callSid: string, state: CallState) {
       state.nextQuestion = nextQuestion;
     }
 
-    // Broadcast analysis results to dashboard
-    broadcastToDashboard({
-      type: 'analysis',
-      call_sid: callSid,
-      incident: state.incident,
-      urgency: state.urgency,
-      nextQuestion: state.nextQuestion,
-    });
+    // Route analysis to appropriate dashboard based on AI mode
+    if (state.isAiMode) {
+      // Update AI monitor call with new analysis
+      const aiCall = aiCallsMap.get(callSid);
+      if (aiCall) {
+        aiCall.incident = state.incident;
+        aiCall.urgency = state.urgency;
+        broadcastToAiMonitor({ type: 'ai_call_update', call: aiCall });
+        broadcastToAiMonitor({
+          type: 'ai_analysis',
+          call_sid: callSid,
+          incident: state.incident,
+          urgency: state.urgency,
+        });
+      }
+    } else {
+      // Broadcast analysis results to human dispatcher dashboard
+      broadcastToDashboard({
+        type: 'analysis',
+        call_sid: callSid,
+        incident: state.incident,
+        urgency: state.urgency,
+        nextQuestion: state.nextQuestion,
+      });
+    }
+
+    // If we have a textual location, try geocoding server-side and push precise coords
+    if (state.incident.location && !state.isAiMode) {
+      // Only do geocoding for human dispatcher dashboard (AI monitor doesn't need map)
+      const currentAddr = state.incident.location.trim();
+      const last = lastGeocodedAddress.get(callSid);
+      if (currentAddr && currentAddr !== last) {
+        try {
+          const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&q=${encodeURIComponent(currentAddr)}&addressdetails=0&limit=1`;
+          const resp = await fetch(url, { headers: { 'User-Agent': 'dispatchiq/1.0 (map-geo)' } as any });
+          if (resp.ok) {
+            const arr = await resp.json();
+            const item = Array.isArray(arr) && arr.length ? arr[0] : null;
+            if (item?.lat && item?.lon) {
+              const lat = parseFloat(item.lat);
+              const lon = parseFloat(item.lon);
+              if (Number.isFinite(lat) && Number.isFinite(lon)) {
+                lastGeocodedAddress.set(callSid, currentAddr);
+                console.log(`🗺️  Geocoded "${currentAddr}" →`, { lat, lon });
+                broadcastToDashboard({
+                  type: 'geo',
+                  call_sid: callSid,
+                  lat,
+                  lon,
+                  address: currentAddr,
+                  source: 'server_geocode',
+                  timestamp: new Date().toISOString(),
+                });
+              }
+            }
+          } else {
+            console.warn(`⚠️  Geocode failed (${resp.status}) for address: ${currentAddr}`);
+          }
+        } catch (e) {
+          console.warn('⚠️  Geocode error:', e);
+        }
+      }
+    }
   } catch (error) {
     console.error('❌ Error calling analysis API:', error);
   }
@@ -1251,11 +1523,13 @@ httpServer.listen(Number(PORT), '0.0.0.0', () => {
   console.log('\n🚨 SignalOne Server (OpenAI Realtime API)');
   console.log('==========================================');
   console.log(`✅ HTTP Server: http://localhost:${PORT}`);
-  console.log(`✅ WebSocket: ws://localhost:${PORT}/twilio/media`);
-  console.log(`✅ Dashboard: ws://localhost:${PORT}/dashboard`);
+  console.log(`✅ WebSocket (Twilio): ws://localhost:${PORT}/twilio/media`);
+  console.log(`✅ WebSocket (Human Dashboard): ws://localhost:${PORT}/dashboard`);
+  console.log(`✅ WebSocket (AI Monitor): ws://localhost:${PORT}/ai-monitor`);
   console.log(`✅ Health check: http://localhost:${PORT}/health`);
   console.log('\n📞 Twilio webhook URL: POST http://localhost:${PORT}/twilio/voice');
   console.log(`🎙️  Voice: ${VOICE}`);
+  console.log(`🤖 AI Mode: ${aiModeEnabled ? 'ON' : 'OFF'} (toggle via POST /api/ai-mode)`);
   console.log('🔌 Active connections: 0\n');
 });
 

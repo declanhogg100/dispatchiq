@@ -6,14 +6,18 @@ import { AICall, AICallAction, TranscriptMessage, IncidentDetails, Urgency } fro
 
 export default function MonitorPage() {
   const [calls, setCalls] = useState<AICall[]>([]);
-  const [selectedCall, setSelectedCall] = useState<AICall | null>(null);
-  const [isSimulating, setIsSimulating] = useState(false);
+  const [selectedCallId, setSelectedCallId] = useState<string | null>(null);
   const [aiModeEnabled, setAiModeEnabled] = useState(false);
   const [wsConnected, setWsConnected] = useState(false);
+  
+  // Derive selectedCall from calls array and selectedCallId
+  const selectedCall = selectedCallId ? calls.find(c => c.callSid === selectedCallId) || null : null;
 
   // Connect to WebSocket for AI call updates
   useEffect(() => {
-    const wsUrl = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:3001/dashboard';
+    // Use the AI monitor WebSocket endpoint (not the regular dashboard)
+    const baseWsUrl = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:3001/dashboard';
+    const wsUrl = baseWsUrl.replace('/dashboard', '/ai-monitor');
     console.log('🔌 Connecting to AI Monitor WebSocket:', wsUrl);
     
     let ws: WebSocket | null = null;
@@ -31,6 +35,11 @@ export default function MonitorPage() {
         try {
           const data = JSON.parse(event.data);
           
+          // Handle AI mode status update
+          if (data.type === 'ai_mode_status') {
+            setAiModeEnabled(data.aiModeEnabled);
+          }
+          
           // Handle AI call updates
           if (data.type === 'ai_call_update') {
             setCalls(prev => {
@@ -40,19 +49,16 @@ export default function MonitorPage() {
               }
               return [...prev, data.call];
             });
-            
-            // Update selected call if it matches
-            if (selectedCall?.callSid === data.call.callSid) {
-              setSelectedCall(data.call);
-            }
+            // selectedCall is derived from calls, so no need to update separately
           }
           
           // Handle new AI call
           if (data.type === 'ai_call_started') {
+            console.log('📞 New AI call started:', data.callSid, data.scenario);
             const newCall: AICall = {
               id: data.callSid,
               callSid: data.callSid,
-              scenario: data.scenario || 'Unknown Emergency',
+              scenario: data.scenario || 'Live Emergency Call',
               status: 'active',
               urgency: 'Low',
               incident: {
@@ -67,13 +73,19 @@ export default function MonitorPage() {
               actions: [],
               startedAt: new Date(data.timestamp),
             };
-            setCalls(prev => [...prev, newCall]);
+            setCalls(prev => {
+              // Avoid duplicates
+              if (prev.some(c => c.callSid === data.callSid)) return prev;
+              return [...prev, newCall];
+            });
           }
           
           // Handle AI transcript (for real AI calls)
           if (data.type === 'ai_transcript') {
             setCalls(prev => prev.map(call => {
               if (call.callSid === data.call_sid) {
+                // Avoid duplicate messages
+                if (call.messages.some(m => m.id === data.id)) return call;
                 const newMessage: TranscriptMessage = {
                   id: data.id,
                   sender: data.sender,
@@ -154,25 +166,10 @@ export default function MonitorPage() {
       if (ws) ws.close();
       if (reconnectTimer) clearTimeout(reconnectTimer);
     };
-  }, [selectedCall?.callSid]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // Empty dependency - only connect once on mount
 
-  // Start simulation
-  const startSimulation = async (numCalls: number) => {
-    setIsSimulating(true);
-    try {
-      const response = await fetch('/api/simulate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ numCalls }),
-      });
-      if (!response.ok) throw new Error('Failed to start simulation');
-      console.log('✅ Simulation started');
-    } catch (error) {
-      console.error('❌ Failed to start simulation:', error);
-    }
-  };
-
-  // Toggle AI mode for next real call
+  // Toggle AI mode for real calls
   const toggleAIMode = async () => {
     try {
       const response = await fetch('/api/ai-mode', {
@@ -215,7 +212,7 @@ export default function MonitorPage() {
   // Clear completed calls
   const clearCompleted = () => {
     setCalls(prev => prev.filter(c => c.status !== 'completed'));
-    if (selectedCall?.status === 'completed') setSelectedCall(null);
+    if (selectedCall?.status === 'completed') setSelectedCallId(null);
   };
 
   const activeCalls = calls.filter(c => c.status !== 'completed');
@@ -261,30 +258,16 @@ export default function MonitorPage() {
               AI Mode {aiModeEnabled ? 'ON' : 'OFF'}
             </button>
             
-            <div className="h-6 w-px bg-border" />
-            
-            <button
-              onClick={() => startSimulation(5)}
-              disabled={isSimulating}
-              className="px-4 py-2 bg-primary text-primary-foreground rounded-lg font-medium text-sm hover:bg-primary/90 transition-colors disabled:opacity-50"
-            >
-              Simulate 5 Calls
-            </button>
-            <button
-              onClick={() => startSimulation(10)}
-              disabled={isSimulating}
-              className="px-4 py-2 bg-primary text-primary-foreground rounded-lg font-medium text-sm hover:bg-primary/90 transition-colors disabled:opacity-50"
-            >
-              Simulate 10 Calls
-            </button>
-            
             {calls.some(c => c.status === 'completed') && (
-              <button
-                onClick={clearCompleted}
-                className="px-3 py-2 bg-secondary text-secondary-foreground hover:bg-secondary/80 rounded-lg text-sm transition-colors"
-              >
-                Clear Completed
-              </button>
+              <>
+                <div className="h-6 w-px bg-border" />
+                <button
+                  onClick={clearCompleted}
+                  className="px-3 py-2 bg-secondary text-secondary-foreground hover:bg-secondary/80 rounded-lg text-sm transition-colors"
+                >
+                  Clear Completed
+                </button>
+              </>
             )}
           </div>
         </div>
@@ -309,8 +292,8 @@ export default function MonitorPage() {
                 <CallCard 
                   key={call.callSid} 
                   call={call} 
-                  isSelected={selectedCall?.callSid === call.callSid}
-                  onClick={() => setSelectedCall(call)}
+                  isSelected={selectedCallId === call.callSid}
+                  onClick={() => setSelectedCallId(call.callSid)}
                 />
               ))
             )}
@@ -501,27 +484,31 @@ function CallDetails({ call, onApproveAction }: {
       )}
 
       {/* Live Transcript */}
-      <div className="rounded-xl border border-border bg-card p-6">
-        <h3 className="text-base font-semibold text-foreground mb-4">Live Transcript</h3>
-        <div className="max-h-96 overflow-y-auto space-y-3 bg-secondary/30 rounded-lg p-4">
+      <div className="rounded-xl border border-border bg-card overflow-hidden">
+        <div className="border-b border-border bg-muted/50 px-6 py-4">
+          <h3 className="font-semibold text-foreground">Live Transcript</h3>
+        </div>
+        <div className="max-h-96 overflow-y-auto p-4 space-y-4">
           {call.messages.length === 0 ? (
-            <div className="text-muted-foreground text-center py-8 text-sm">
+            <div className="text-muted-foreground text-center py-8 text-sm italic">
               Waiting for conversation to begin...
             </div>
           ) : (
             call.messages.map((msg) => (
-              <div 
-                key={msg.id} 
-                className={`p-3 rounded-lg ${
-                  msg.sender === 'caller' 
-                    ? 'bg-muted/50' 
-                    : 'bg-primary/10 border border-primary/20'
-                }`}
-              >
-                <div className="text-xs uppercase tracking-wide font-medium text-muted-foreground mb-1">
-                  {msg.sender === 'caller' ? 'Caller' : 'AI Dispatcher'}
+              <div key={msg.id} className="flex flex-col gap-1">
+                <div className="flex items-center gap-2">
+                  <span className={`text-xs font-bold uppercase tracking-wider ${
+                    msg.sender === 'dispatcher' ? 'text-blue-600' : 'text-zinc-600'
+                  }`}>
+                    {msg.sender === 'dispatcher' ? 'AI Dispatcher' : 'Caller'}
+                  </span>
+                  <span className="text-[10px] text-muted-foreground font-mono">
+                    {new Date(msg.timestamp).toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                  </span>
                 </div>
-                <div className="text-sm text-foreground">{msg.text}</div>
+                <p className={`text-sm leading-relaxed text-foreground ${msg.isPartial ? 'opacity-70' : ''}`}>
+                  {msg.text}
+                </p>
               </div>
             ))
           )}

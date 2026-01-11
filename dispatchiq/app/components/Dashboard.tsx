@@ -40,6 +40,8 @@ export default function Dashboard() {
   const [isGeneratingReport, setIsGeneratingReport] = useState(false);
   const [etaMinutes, setEtaMinutes] = useState<number | null>(null);
   const [coords, setCoords] = useState<{ lat: number; lon: number } | null>(null);
+  const [routeGeometry, setRouteGeometry] = useState<any>(null);
+  const [stationCoords, setStationCoords] = useState<{ lat: number; lon: number } | null>(null);
 
   // Subscribe to real-time transcripts via direct WebSocket connection to backend
   useEffect(() => {
@@ -89,6 +91,30 @@ export default function Dashboard() {
                         setShowReportButton(false);
                         setReportUrl(null);
                         setReport(null);
+                    }
+                } else if (data.type === 'analysis') {
+                    // Trust server-side analysis when available (works even without client API keys)
+                    console.log('[Map] WS analysis update received', data);
+                    if (data.incident) {
+                        setIncidentDetails((prev) => ({ ...prev, ...data.incident }));
+                    }
+                    if (data.urgency) {
+                        setUrgency(data.urgency);
+                    }
+                    if (typeof data.nextQuestion !== 'undefined') {
+                        setNextQuestion(data.nextQuestion);
+                    }
+                } else if (data.type === 'geo' || data.type === 'location_update') {
+                    // Server-pushed precise coordinates from phone API
+                    console.log('[Map] ✅ WS geolocation update received:', data);
+                    if (typeof data.lat === 'number' && typeof data.lon === 'number') {
+                      console.log('[Map] Setting coords:', { lat: data.lat, lon: data.lon });
+                      setCoords({ lat: data.lat, lon: data.lon });
+                    } else {
+                      console.warn('[Map] Invalid lat/lon in geo message:', data);
+                    }
+                    if (data.address) {
+                      setIncidentDetails((prev) => ({ ...prev, location: data.address }));
                     }
                 } else if (data.type === 'call_ended') {
                     console.log('🏁 Call ended, switching to standby');
@@ -219,28 +245,71 @@ export default function Dashboard() {
     };
   }, [messages, callAnalysisApi]);
 
-  // Fetch ETA when location changes
+  // Fetch ETA when location or precise coords change
   useEffect(() => {
     const fetchEta = async () => {
-      if (!incidentDetails.location) {
-        setEtaMinutes(null);
-        setCoords(null);
+      // Prefer precise coordinates if available
+      if (coords?.lat && coords?.lon) {
+        console.log('[Map] 📍 Fetching ETA by coords', coords);
+        try {
+          const res = await fetch(`/api/police-eta?lat=${coords.lat}&lon=${coords.lon}`);
+          console.log('[Map] ETA response status:', res.status);
+          if (!res.ok) {
+            const errorText = await res.text();
+            console.warn('[Map] ⚠️ ETA-by-coords non-OK', res.status, errorText);
+            return;
+          }
+          const data = await res.json();
+          console.log('[Map] ✅ ETA data received:', data);
+          setEtaMinutes(data.etaMinutes ?? null);
+          if (data.routeGeometry) {
+            setRouteGeometry(JSON.parse(data.routeGeometry));
+          }
+          if (data.station) {
+            setStationCoords({ lat: data.station.lat, lon: data.station.lon });
+          }
+        } catch (error) {
+          console.error('[Map] ❌ ETA-by-coords failed', error);
+        }
         return;
       }
+
+      // Otherwise, geocode from address
+      if (!incidentDetails.location) {
+        console.log('[Map] No location/address yet; skipping ETA');
+        setEtaMinutes(null);
+        setCoords(null);
+        setRouteGeometry(null);
+        setStationCoords(null);
+        return;
+      }
+      console.log('[Map] 🔍 Fetching ETA by address', incidentDetails.location);
       try {
         const res = await fetch(`/api/police-eta?address=${encodeURIComponent(incidentDetails.location)}`);
-        if (!res.ok) return;
+        console.log('[Map] ETA response status:', res.status);
+        if (!res.ok) { 
+          const errorText = await res.text();
+          console.warn('[Map] ⚠️ ETA-by-address non-OK', res.status, errorText);
+          return; 
+        }
         const data = await res.json();
+        console.log('[Map] ✅ ETA data received:', data);
         setEtaMinutes(data.etaMinutes ?? null);
         if (data.lat && data.lon) {
           setCoords({ lat: data.lat, lon: data.lon });
         }
+        if (data.routeGeometry) {
+          setRouteGeometry(JSON.parse(data.routeGeometry));
+        }
+        if (data.station) {
+          setStationCoords({ lat: data.station.lat, lon: data.station.lon });
+        }
       } catch (error) {
-        console.error('ETA fetch failed', error);
+        console.error('[Map] ❌ ETA-by-address failed', error);
       }
     };
     fetchEta();
-  }, [incidentDetails.location]);
+  }, [incidentDetails.location, coords?.lat, coords?.lon]);
 
   return (
     <div className="flex h-screen w-full flex-col bg-background">
@@ -278,6 +347,9 @@ export default function Dashboard() {
                 lon={coords?.lon ?? null}
                 etaMinutes={etaMinutes}
                 address={incidentDetails.location}
+                routeGeometry={routeGeometry}
+                stationLat={stationCoords?.lat ?? null}
+                stationLon={stationCoords?.lon ?? null}
               />
             </div>
 
