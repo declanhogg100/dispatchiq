@@ -368,9 +368,7 @@ export default function MonitorPage() {
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 3v2m6-2v2M9 19v2m6-2v2M5 9H3m2 6H3m18-6h-2m2 6h-2M7 19h10a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2zM9 9h6v6H9V9z" />
                 </svg>
                 <p className="text-lg font-medium text-foreground mb-2">No AI Calls Active</p>
-                <p className="text-sm text-muted-foreground max-w-sm">
-                  Click &quot;Simulate Calls&quot; to demo the AI system or enable &quot;AI Mode&quot; to route the next real call here
-                </p>
+
               </div>
             ) : (
               sortedCalls.map((call) => (
